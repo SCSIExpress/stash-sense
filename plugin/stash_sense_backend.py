@@ -392,6 +392,15 @@ def handle_face_groups(mode, args, sidecar_url):
         return sidecar_post(sidecar_url, f"/face-groups/{args['cluster_id']}/ignore")
     elif mode == "fg_delete":
         return sidecar_delete(sidecar_url, f"/face-groups/{args['cluster_id']}")
+    elif mode == "fg_eject":
+        return sidecar_post(sidecar_url, f"/face-groups/{args['cluster_id']}/eject", {
+            "face_ids": args["face_ids"],
+            "mode": args.get("mode", "eject"),
+        })
+    elif mode == "fg_unban":
+        return sidecar_post(sidecar_url, "/face-groups/unban", {"face_ids": args["face_ids"]})
+    elif mode == "fg_banned":
+        return sidecar_get(sidecar_url, "/face-groups/banned/list")
     elif mode == "fg_merge":
         return sidecar_post(sidecar_url, "/face-groups/merge", {
             "source_ids": args["source_ids"],

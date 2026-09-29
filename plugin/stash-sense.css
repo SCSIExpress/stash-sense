@@ -3705,3 +3705,24 @@ a.ss-upstream-endpoint-badge:hover {
 .ss-fg-thumb:hover {
   border-color: var(--ss-accent, #7b5cff);
 }
+
+/* Face group detail (expand) view */
+.ss-fg-detail-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.ss-fg-detail-grid .ss-fg-thumb {
+  width: 96px;
+  height: 96px;
+}
+
+.ss-fg-thumb.ss-fg-selected {
+  outline: 3px solid #e04848;
+  outline-offset: -3px;
+}
+
+.ss-fg-thumb-wrap:hover .ss-fg-thumb {
+  border-color: var(--ss-accent, #7b5cff);
+}

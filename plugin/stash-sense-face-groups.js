@@ -39,6 +39,9 @@
     async merge(sourceIds, targetId) { return apiCall('fg_merge', { source_ids: sourceIds, target_id: targetId }); },
     async rename(clusterId, name) { return apiCall('fg_update', { cluster_id: clusterId, name }); },
     async crop(clusterId, faceId) { return apiCall('fg_crop', { cluster_id: clusterId, face_id: faceId }); },
+    async eject(clusterId, faceIds, mode) { return apiCall('fg_eject', { cluster_id: clusterId, face_ids: faceIds, mode }); },
+    async unban(faceIds) { return apiCall('fg_unban', { face_ids: faceIds }); },
+    async banned() { return apiCall('fg_banned'); },
     async searchPerformers(query) { return apiCall('search_performers', { query }); },
     async createAndAssign(clusterId, name, opts = {}) {
       return apiCall('fg_create_and_assign', { cluster_id: clusterId, name, ...opts });
@@ -100,8 +103,9 @@
           ${selectionMode
             ? `<button class="ss-btn ss-btn-primary" id="fg-merge-btn" ${selectedClusters.size < 2 ? 'disabled' : ''}>Merge (${selectedClusters.size})</button>
                <button class="ss-btn ss-btn-secondary" id="fg-cancel-select">Cancel</button>`
-            : `<button class="ss-btn ss-btn-secondary" id="fg-select-toggle">Select / Merge</button>`}
-          <button class="ss-btn ss-btn-primary" id="fg-rebuild">Rebuild Groups</button>
+            : `<button class="ss-btn ss-btn-secondary" id="fg-select-toggle">Select / Merge</button>
+               <button class="ss-btn ss-btn-secondary" id="fg-banned-btn">Banned faces</button>`}
+          <button class="ss-btn ss-btn-primary" id="fg-rebuild">Update Groups</button>
         </div>
       </div>`;
 
@@ -172,6 +176,9 @@
       renderList(container);
     });
 
+    const bannedBtn = container.querySelector('#fg-banned-btn');
+    if (bannedBtn) bannedBtn.addEventListener('click', () => renderBannedList(container));
+
     const mergeBtn = container.querySelector('#fg-merge-btn');
     if (mergeBtn) mergeBtn.addEventListener('click', () => {
       if (selectedClusters.size < 2) return;
@@ -197,11 +204,21 @@
 
   function wireCards(container) {
     container.querySelectorAll('.fg-select').forEach(cb => {
+      cb.addEventListener('click', (e) => e.stopPropagation());
       cb.addEventListener('change', () => {
         const id = parseInt(cb.dataset.clusterId, 10);
         if (cb.checked) selectedClusters.add(id); else selectedClusters.delete(id);
         renderList(container);
       });
+    });
+
+    // clicking a card (outside buttons) opens the detail/expand view
+    container.querySelectorAll('.ss-performer-option[data-cluster-id]').forEach(card => {
+      card.addEventListener('click', (e) => {
+        if (e.target.closest('button') || e.target.closest('input') || selectionMode) return;
+        openGroupDetail(parseInt(card.dataset.clusterId, 10), container);
+      });
+      card.style.cursor = 'pointer';
     });
 
     container.querySelectorAll('.fg-ignore').forEach(btn => {
@@ -239,6 +256,166 @@
       } catch (e) {
         el.innerHTML = `<span style="opacity:.5;">${esc(e.message)}</span>`;
       }
+    });
+  }
+
+  // ==================== Group Detail (expand) ====================
+
+  let ejectMode = null; // null | 'eject' | 'ban'
+  let ejectedFaces = new Set();
+
+  function renderBannedList(container) {
+    const panel = document.getElementById('ss-face-groups') || container;
+    panel.innerHTML = '<div class="ss-loading"><div class="ss-loading-text">Loading banned faces…</div></div>';
+    FaceGroupsAPI.banned().then(({ faces }) => {
+      const header = `
+        <div class="ss-actions" style="display:flex;justify-content:space-between;align-items:center;">
+          <h2 style="margin:0;">Banned faces (${faces.length})</h2>
+          <button class="ss-btn ss-btn-sm ss-btn-secondary" id="fg-back">← All groups</button>
+        </div>
+        <p style="opacity:.65;">These are excluded from all clustering. Select faces to restore them to the unassigned pool.</p>`;
+      if (!faces.length) {
+        panel.innerHTML = `${header}<div class="ss-empty-state"><p>No banned faces.</p></div>`;
+      } else {
+        panel.innerHTML = `${header}<div class="ss-fg-detail-grid">${faces.map(f => `
+          <div class="ss-fg-thumb-wrap" style="position:relative;">
+            <img class="ss-fg-thumb ss-fg-unban" data-face-id="${f.id}" data-cluster-id="${f.cluster_id}" alt="face" style="cursor:pointer;" />
+          </div>`).join('')}</div>`;
+        panel.querySelectorAll('.ss-fg-unban').forEach(img => {
+          FaceGroupsAPI.crop(parseInt(img.dataset.clusterId, 10), parseInt(img.dataset.faceId, 10))
+            .then(r => { if (r.data_url) img.src = r.data_url; }).catch(() => {});
+        });
+      }
+      panel.querySelector('#fg-back').addEventListener('click', () => renderList(container));
+    }).catch(e => {
+      panel.innerHTML = `<div class="ss-empty-state"><p>${esc(e.message)}</p></div>`;
+    });
+  }
+
+  function openGroupDetail(clusterId, container) {
+    const dashboard = document.getElementById('ss-recommendations');
+    const panel = document.getElementById('ss-face-groups') || dashboard;
+    panel.innerHTML = '<div class="ss-loading"><div class="ss-loading-text">Loading group…</div></div>';
+
+    FaceGroupsAPI.get(clusterId).then(cluster => {
+      renderGroupDetail(cluster, panel, container);
+    }).catch(e => {
+      panel.innerHTML = `<div class="ss-empty-state"><p>${esc(e.message)}</p></div>`;
+    });
+  }
+
+  function renderGroupDetail(cluster, panel, container) {
+    const c = cluster.id;
+    const header = `
+      <div class="ss-actions" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button class="ss-btn ss-btn-sm ss-btn-secondary" id="fg-back">← All groups</button>
+          <h2 style="margin:0;">${cluster.name ? esc(cluster.name) : `Group #${c}`}</h2>
+          ${statusBadge(cluster.status)}
+          ${cluster.performer_name ? `<span style="opacity:.8;">→ ${esc(cluster.performer_name)}</span>` : ''}
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          ${ejectMode === null ? `
+            <span style="opacity:.7;">Click faces to select</span>
+            <button class="ss-btn ss-btn-sm ss-btn-secondary" id="fg-eject-mode">Remove faces</button>
+          ` : `
+            <span style="opacity:.7;">${ejectedFaces.size} selected</span>
+            <button class="ss-btn ss-btn-sm ss-btn-primary" id="fg-eject-confirm" ${ejectedFaces.size ? '' : 'disabled'}>
+              ${ejectMode === 'ban' ? 'Ban selected' : 'Remove selected'}
+            </button>
+            <button class="ss-btn ss-btn-sm ss-btn-secondary" id="fg-eject-cancel">Cancel</button>
+          `}
+        </div>
+      </div>
+      <p style="opacity:.65;margin:0 0 12px;">${cluster.face_count} faces across ${cluster.scene_ids ? cluster.scene_ids.length : '?'} scenes.
+      ${ejectMode ? (ejectMode === 'ban'
+        ? 'Banned faces are junk detections — they will never be clustered again (reviewable via Banned list).'
+        : 'Removed faces return to the unassigned pool and may re-group on the next update.') : ''}
+      </p>`;
+
+    const faces = cluster.faces || [];
+    const thumbGrid = faces.map(f => `
+      <div class="ss-fg-thumb-wrap" data-face-id="${f.id}" style="position:relative;">
+        <img class="ss-fg-thumb ${ejectedFaces.has(f.id) ? 'ss-fg-selected' : ''}" data-face-id="${f.id}"
+             alt="face" style="cursor:pointer; ${ejectedFaces.has(f.id) ? 'outline:3px solid #e04848;outline-offset:-3px;' : ''}" />
+        <div style="font-size:.65em;opacity:.6;text-align:center;">scene ${f.stash_scene_id}</div>
+      </div>`).join('');
+
+    panel.innerHTML = `
+      ${header}
+      ${cluster.top_matches && cluster.top_matches.length && cluster.status !== 'assigned' ? `
+        <div style="margin-bottom:12px;font-size:.9em;opacity:.75;">
+          Identify-time matches: ${cluster.top_matches.map(m => `${esc(m.name)} (${m.face_count})`).join(', ')}
+        </div>` : ''}
+      <div class="ss-fg-detail-grid">${thumbGrid || '<span style="opacity:.5;">No stored face images.</span>'}</div>`;
+
+    // back
+    panel.querySelector('#fg-back').addEventListener('click', () => {
+      ejectMode = null; ejectedFaces.clear();
+      renderList(container);
+    });
+
+    // eject mode toggle
+    const modeBtn = panel.querySelector('#fg-eject-mode');
+    if (modeBtn) modeBtn.addEventListener('click', () => {
+      // two-step: first click arms "remove", a small toggle lets you choose ban
+      ejectMode = 'eject';
+      renderGroupDetail(cluster, panel, container);
+      // offer ban via a confirm-time choice
+    });
+
+    const cancelBtn = panel.querySelector('#fg-eject-cancel');
+    if (cancelBtn) cancelBtn.addEventListener('click', () => {
+      ejectMode = null; ejectedFaces.clear();
+      renderGroupDetail(cluster, panel, container);
+    });
+
+    const confirmBtn = panel.querySelector('#fg-eject-confirm');
+    if (confirmBtn) confirmBtn.addEventListener('click', async () => {
+      const ids = [...ejectedFaces];
+      if (!ids.length) return;
+      let mode = ejectMode;
+      if (mode === 'eject') {
+        const ban = confirm('Also BAN these faces from ever being clustered again (for junk detections)?\n\nOK = ban permanently, Cancel = just remove from group');
+        mode = ban ? 'ban' : 'eject';
+      }
+      try {
+        const r = await FaceGroupsAPI.eject(c, ids, mode);
+        alert(mode === 'ban' ? `Banned ${r.banned} face(s).` : `Removed ${r.ejected} face(s).`);
+        ejectMode = null; ejectedFaces.clear();
+        renderList(container);
+      } catch (e) {
+        alert(`Failed: ${e.message}`);
+      }
+    });
+
+    // face click = select (only in eject mode) else open scene
+    panel.querySelectorAll('.ss-fg-thumb').forEach(img => {
+      img.addEventListener('click', async () => {
+        const fid = parseInt(img.dataset.faceId, 10);
+        if (ejectMode) {
+          if (ejectedFaces.has(fid)) ejectedFaces.delete(fid); else ejectedFaces.add(fid);
+          img.classList.toggle('ss-fg-selected');
+          img.style.outline = ejectedFaces.has(fid) ? '3px solid #e04848' : '';
+          img.style.outlineOffset = '-3px';
+          const span = panel.querySelector('#fg-eject-confirm');
+          if (span) {
+            span.disabled = !ejectedFaces.size;
+            span.textContent = `${ejectMode === 'ban' ? 'Ban' : 'Remove'} selected (${ejectedFaces.size})`;
+          }
+          const selCount = panel.querySelector('.ss-actions span[style*="opacity"]');
+          return;
+        }
+        // default: jump to the scene in Stash
+        const face = faces.find(f => f.id === fid);
+        if (face) window.location.href = `/scenes/${face.stash_scene_id}`;
+      });
+    });
+
+    // load crops
+    panel.querySelectorAll('.ss-fg-thumb').forEach(img => {
+      const fid = parseInt(img.dataset.faceId, 10);
+      FaceGroupsAPI.crop(c, fid).then(r => { if (r.data_url) img.src = r.data_url; }).catch(() => {});
     });
   }
 

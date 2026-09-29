@@ -66,6 +66,14 @@ class UpdateClusterRequest(BaseModel):
     status: str | None = None
 
 
+class FaceIdsRequest(BaseModel):
+    face_ids: list[int]
+
+
+class EjectRequest(FaceIdsRequest):
+    mode: str = Field("eject", description="eject (back to pool) or ban (never cluster again)")
+
+
 class ClusterOut(BaseModel):
     id: int
     name: str | None
@@ -123,12 +131,12 @@ async def cluster_stats():
 
 
 @router.get("/{cluster_id}")
-async def get_cluster(cluster_id: int):
+async def get_cluster(cluster_id: int, limit: int = Query(200, ge=1, le=2000)):
     db = get_rec_db()
     cluster = db.get_face_cluster(cluster_id)
     if cluster is None:
         raise HTTPException(404, f"cluster {cluster_id} not found")
-    faces = db.get_representative_faces(cluster_id, limit=60)
+    faces = db.get_representative_faces(cluster_id, limit=limit)
     return {
         **cluster,
         "face_count": db.get_cluster_face_count(cluster_id),
@@ -220,6 +228,33 @@ async def split_cluster(cluster_id: int, req: SplitClusterRequest):
         raise HTTPException(404, f"cluster {cluster_id} not found")
     new_id = get_face_cluster_service().split_cluster(cluster_id, req.face_ids)
     return {"new_cluster_id": new_id}
+
+
+@router.post("/{cluster_id}/eject")
+async def eject_faces(cluster_id: int, req: EjectRequest):
+    """Remove faces from a group. mode=eject returns them to the unassigned pool;
+    mode=ban additionally excludes them from all future clustering (junk faces)."""
+    service = get_face_cluster_service()
+    db = get_rec_db()
+    if db.get_face_cluster(cluster_id) is None:
+        raise HTTPException(404, f"cluster {cluster_id} not found")
+    if req.mode == "ban":
+        held = service.ban_faces(req.face_ids)
+        service.eject_faces(cluster_id, req.face_ids)  # also clears membership
+        return {"banned": held}
+    removed = service.eject_faces(cluster_id, req.face_ids)
+    return {"ejected": removed}
+
+
+@router.post("/unban")
+async def unban_faces(req: FaceIdsRequest):
+    """Return banned faces to the unassigned pool."""
+    return {"unbanned": get_face_cluster_service().unban_faces(req.face_ids)}
+
+
+@router.get("/banned/list")
+async def list_banned(limit: int = Query(500, ge=1, le=2000)):
+    return {"faces": get_face_cluster_service().get_banned_faces(limit)}
 
 
 @router.get("/{cluster_id}/face/{face_id}/crop")

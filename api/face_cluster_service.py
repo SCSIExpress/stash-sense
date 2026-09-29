@@ -220,7 +220,7 @@ class FaceClusterService:
                 centroids[cid] = new_cent
             # auto-tag newly absorbed faces' scenes for assigned groups
             if auto_tag and status_of.get(cid) == "assigned" and stash_client is not None:
-                pid, pname = performer_of.get(cid, (None, None))
+                pid, _pname = performer_of.get(cid, (None, None))
                 if pid:
                     for fid in face_ids:
                         face = self.db.get_library_face(fid)
@@ -336,6 +336,56 @@ class FaceClusterService:
         self.db.remove_faces_from_cluster(cluster_id, face_ids)
         self.db.add_faces_to_cluster(cid, face_ids)
         return cid
+
+    def eject_faces(self, cluster_id: int, face_ids: list[int]) -> int:
+        """Remove faces from a group; they return to the unassigned pool and can
+        be absorbed into other groups (or new ones) on the next incremental run."""
+        removed = self.db.remove_faces_from_cluster(cluster_id, face_ids)
+        # Drop now-empty groups (except assigned/ignored ones, which are user state)
+        cluster = self.db.get_face_cluster(cluster_id)
+        if cluster and cluster["status"] in ("open", "matched") and self.db.get_cluster_face_count(cluster_id) == 0:
+            self.db.delete_face_cluster(cluster_id)
+        return removed
+
+    def ban_faces(self, face_ids: list[int]) -> int:
+        """Eject faces from any live group and put them in a singleton 'banned'
+        group — junk detections (background people, wrong boxes) that should
+        never be clustered again. Banned faces are excluded from all
+        clustering passes."""
+        held = 0
+        for fid in face_ids:
+            for membership in self.db.get_face_cluster_membership(fid):
+                if membership["status"] in ("ignored", "banned"):
+                    continue
+                self.db.remove_faces_from_cluster(membership["id"], [fid])
+            # dedupe: a face only needs one banned marker
+            existing = [m for m in self.db.get_face_cluster_membership(fid) if m["status"] == "banned"]
+            if existing:
+                continue
+            bid = self.db.create_face_cluster(status="banned", name="Banned faces")
+            self.db.add_faces_to_cluster(bid, [fid])
+            held += 1
+        return held
+
+    def unban_faces(self, face_ids: list[int]) -> int:
+        """Return banned faces to the unassigned pool."""
+        removed = 0
+        for fid in face_ids:
+            for membership in self.db.get_face_cluster_membership(fid):
+                if membership["status"] == "banned":
+                    self.db.delete_face_cluster(membership["id"])
+                    removed += 1
+        return removed
+
+    def get_banned_faces(self, limit: int = 500) -> list[dict]:
+        """Faces currently banned, with crops for review/unban."""
+        rows = self.db.get_clusters_by_status("banned")
+        out = []
+        for c in rows[: limit]:
+            for f in self.db.get_representative_faces(c["id"], limit=1):
+                f["cluster_id"] = c["id"]
+                out.append(f)
+        return out
 
     def ignore_cluster(self, cluster_id: int) -> bool:
         """Mark a cluster as ignored (false positives, background faces)."""

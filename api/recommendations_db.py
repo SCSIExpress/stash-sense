@@ -7,13 +7,13 @@ Separate from the distributed performers.db to allow independent updates.
 See: docs/plans/2026-01-28-recommendations-engine-design.md
 """
 
-import sqlite3
 import json
+import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Iterator, Any
-
+from typing import Any, Optional
 
 SCHEMA_VERSION = 11
 
@@ -27,11 +27,11 @@ class Recommendation:
     target_type: str  # 'scene', 'performer', 'studio', 'file'
     target_id: str
     details: dict
-    resolution_action: Optional[str]
-    resolution_details: Optional[dict]
-    resolved_at: Optional[str]
-    confidence: Optional[float]
-    source_analysis_id: Optional[int]
+    resolution_action: str | None
+    resolution_details: dict | None
+    resolved_at: str | None
+    confidence: float | None
+    source_analysis_id: int | None
     created_at: str
     updated_at: str
 
@@ -43,12 +43,12 @@ class AnalysisRun:
     type: str
     status: str  # 'running', 'completed', 'failed'
     started_at: str
-    completed_at: Optional[str]
-    items_total: Optional[int]
-    items_processed: Optional[int]
+    completed_at: str | None
+    items_total: int | None
+    items_processed: int | None
     recommendations_created: int
-    cursor: Optional[str]
-    error_message: Optional[str]
+    cursor: str | None
+    error_message: str | None
 
 
 @dataclass
@@ -56,12 +56,12 @@ class RecommendationSettings:
     """Settings for a recommendation type."""
     type: str
     enabled: bool
-    auto_dismiss_threshold: Optional[float]
+    auto_dismiss_threshold: float | None
     notify: bool
-    interval_hours: Optional[int]
-    last_run_at: Optional[str]
-    next_run_at: Optional[str]
-    config: Optional[dict]
+    interval_hours: int | None
+    last_run_at: str | None
+    next_run_at: str | None
+    config: dict | None
 
 
 class RecommendationsDB:
@@ -620,9 +620,9 @@ class RecommendationsDB:
         target_type: str,
         target_id: str,
         details: dict,
-        confidence: Optional[float] = None,
-        source_analysis_id: Optional[int] = None,
-    ) -> Optional[int]:
+        confidence: float | None = None,
+        source_analysis_id: int | None = None,
+    ) -> int | None:
         """
         Create a recommendation. Returns ID if created, None if duplicate.
         """
@@ -641,7 +641,7 @@ class RecommendationsDB:
                 # Already exists
                 return None
 
-    def get_recommendation(self, rec_id: int) -> Optional[Recommendation]:
+    def get_recommendation(self, rec_id: int) -> Recommendation | None:
         """Get a recommendation by ID."""
         with self._connection() as conn:
             row = conn.execute(
@@ -653,9 +653,9 @@ class RecommendationsDB:
 
     def get_recommendations(
         self,
-        status: Optional[str] = None,
-        type: Optional[str] = None,
-        target_type: Optional[str] = None,
+        status: str | None = None,
+        type: str | None = None,
+        target_type: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[Recommendation]:
@@ -701,8 +701,8 @@ class RecommendationsDB:
         type: str,
         target_type: str,
         target_id: str,
-        status: Optional[str] = None,
-    ) -> Optional[Recommendation]:
+        status: str | None = None,
+    ) -> Recommendation | None:
         """Get a recommendation by target (uses idx_rec_target index). Returns first match or None."""
         query = "SELECT * FROM recommendations WHERE type = ? AND target_type = ? AND target_id = ?"
         params: list = [type, target_type, target_id]
@@ -735,7 +735,7 @@ class RecommendationsDB:
         self,
         rec_id: int,
         action: str,
-        details: Optional[dict] = None,
+        details: dict | None = None,
     ) -> bool:
         """Mark a recommendation as resolved. Returns True if updated."""
         with self._connection() as conn:
@@ -753,7 +753,7 @@ class RecommendationsDB:
             )
             return cursor.rowcount > 0
 
-    def dismiss_recommendation(self, rec_id: int, reason: Optional[str] = None, permanent: bool = False) -> bool:
+    def dismiss_recommendation(self, rec_id: int, reason: str | None = None, permanent: bool = False) -> bool:
         """Dismiss a recommendation and add to dismissed_targets."""
         with self._connection() as conn:
             # Get the recommendation first
@@ -789,7 +789,7 @@ class RecommendationsDB:
 
             return True
 
-    def batch_dismiss_by_type(self, rec_type: str, permanent: bool = False, reason: Optional[str] = None) -> int:
+    def batch_dismiss_by_type(self, rec_type: str, permanent: bool = False, reason: str | None = None) -> int:
         """Dismiss all pending recommendations of a given type. Returns count dismissed."""
         with self._connection() as conn:
             # Get all pending recs of this type
@@ -904,7 +904,7 @@ class RecommendationsDB:
 
     # ==================== Analysis Runs ====================
 
-    def start_analysis_run(self, type: str, items_total: Optional[int] = None) -> int:
+    def start_analysis_run(self, type: str, items_total: int | None = None) -> int:
         """Start a new analysis run. Returns run ID."""
         with self._connection() as conn:
             cursor = conn.execute(
@@ -921,7 +921,7 @@ class RecommendationsDB:
         run_id: int,
         items_processed: int,
         recommendations_created: int,
-        cursor: Optional[str] = None,
+        cursor: str | None = None,
     ):
         """Update analysis run progress."""
         with self._connection() as conn:
@@ -979,7 +979,7 @@ class RecommendationsDB:
                 (error_message, run_id)
             )
 
-    def get_analysis_run(self, run_id: int) -> Optional[AnalysisRun]:
+    def get_analysis_run(self, run_id: int) -> AnalysisRun | None:
         """Get an analysis run by ID."""
         with self._connection() as conn:
             row = conn.execute(
@@ -989,7 +989,7 @@ class RecommendationsDB:
                 return AnalysisRun(**dict(row))
         return None
 
-    def get_recent_analysis_runs(self, type: Optional[str] = None, limit: int = 20) -> list[AnalysisRun]:
+    def get_recent_analysis_runs(self, type: str | None = None, limit: int = 20) -> list[AnalysisRun]:
         """Get recent analysis runs."""
         query = "SELECT * FROM analysis_runs"
         params = []
@@ -1007,7 +1007,7 @@ class RecommendationsDB:
 
     # ==================== Settings ====================
 
-    def get_settings(self, type: str) -> Optional[RecommendationSettings]:
+    def get_settings(self, type: str) -> RecommendationSettings | None:
         """Get settings for a recommendation type."""
         with self._connection() as conn:
             row = conn.execute(
@@ -1047,11 +1047,11 @@ class RecommendationsDB:
     def upsert_settings(
         self,
         type: str,
-        enabled: Optional[bool] = None,
-        auto_dismiss_threshold: Optional[float] = None,
-        notify: Optional[bool] = None,
-        interval_hours: Optional[int] = None,
-        config: Optional[dict] = None,
+        enabled: bool | None = None,
+        auto_dismiss_threshold: float | None = None,
+        notify: bool | None = None,
+        interval_hours: int | None = None,
+        config: dict | None = None,
     ):
         """Create or update settings for a recommendation type."""
         with self._connection() as conn:
@@ -1098,7 +1098,7 @@ class RecommendationsDB:
 
     # ==================== Watermarks ====================
 
-    def get_watermark(self, type: str) -> Optional[dict]:
+    def get_watermark(self, type: str) -> dict | None:
         """Get analysis watermark for incremental runs."""
         with self._connection() as conn:
             row = conn.execute(
@@ -1111,9 +1111,9 @@ class RecommendationsDB:
     def set_watermark(
         self,
         type: str,
-        last_cursor: Optional[str] = None,
-        last_stash_updated_at: Optional[str] = None,
-        logic_version: Optional[int] = None,
+        last_cursor: str | None = None,
+        last_stash_updated_at: str | None = None,
+        logic_version: int | None = None,
     ):
         """Update analysis watermark."""
         with self._connection() as conn:
@@ -1177,7 +1177,7 @@ class RecommendationsDB:
         entity_type: str,
         endpoint: str,
         stash_box_id: str,
-    ) -> Optional[dict]:
+    ) -> dict | None:
         """Get an upstream snapshot by its unique key. Returns dict with parsed upstream_data, or None."""
         with self._connection() as conn:
             row = conn.execute(
@@ -1204,7 +1204,7 @@ class RecommendationsDB:
 
     # ==================== Upstream Field Config ====================
 
-    def get_enabled_fields(self, endpoint: str, entity_type: str) -> Optional[set[str]]:
+    def get_enabled_fields(self, endpoint: str, entity_type: str) -> set[str] | None:
         """
         Get the set of enabled field names for an endpoint/entity_type.
         Returns None if no config exists (caller should use defaults).
@@ -1248,7 +1248,7 @@ class RecommendationsDB:
 
     # ==================== User Settings ====================
 
-    def get_user_setting(self, key: str) -> Optional[Any]:
+    def get_user_setting(self, key: str) -> Any | None:
         """Get a user setting by key. Returns the parsed JSON value, or None if not found."""
         with self._connection() as conn:
             row = conn.execute(
@@ -1333,7 +1333,7 @@ class RecommendationsDB:
         total_faces: int,
         frames_analyzed: int,
         fingerprint_status: str = "pending",
-        db_version: Optional[str] = None,
+        db_version: str | None = None,
     ) -> int:
         """
         Create or update a scene fingerprint. Returns the fingerprint ID.
@@ -1363,7 +1363,7 @@ class RecommendationsDB:
             )
             return cursor.fetchone()[0]
 
-    def get_scene_fingerprint(self, stash_scene_id: int) -> Optional[dict]:
+    def get_scene_fingerprint(self, stash_scene_id: int) -> dict | None:
         """Get a scene fingerprint by stash scene ID."""
         with self._connection() as conn:
             row = conn.execute(
@@ -1374,7 +1374,7 @@ class RecommendationsDB:
                 return dict(row)
         return None
 
-    def get_all_scene_fingerprints(self, status: Optional[str] = None) -> list[dict]:
+    def get_all_scene_fingerprints(self, status: str | None = None) -> list[dict]:
         """Get all scene fingerprints, optionally filtered by status."""
         with self._connection() as conn:
             if status is not None:
@@ -1391,8 +1391,8 @@ class RecommendationsDB:
         fingerprint_id: int,
         performer_id: str,
         face_count: int,
-        avg_confidence: Optional[float] = None,
-        proportion: Optional[float] = None,
+        avg_confidence: float | None = None,
+        proportion: float | None = None,
     ) -> int:
         """Add or update a face entry in a scene fingerprint. Returns the face entry ID."""
         with self._connection() as conn:
@@ -1457,7 +1457,7 @@ class RecommendationsDB:
             existing = {row[0] for row in rows}
             return [sid for sid in scene_ids if sid not in existing]
 
-    def get_fingerprint_stats(self, current_db_version: Optional[str] = None) -> dict:
+    def get_fingerprint_stats(self, current_db_version: str | None = None) -> dict:
         """Get fingerprint coverage statistics."""
         with self._connection() as conn:
             stats = {}
@@ -1486,7 +1486,7 @@ class RecommendationsDB:
 
             return stats
 
-    def mark_fingerprints_for_refresh(self, scene_ids: Optional[list[int]] = None) -> int:
+    def mark_fingerprints_for_refresh(self, scene_ids: list[int] | None = None) -> int:
         """
         Mark fingerprints for refresh by clearing their db_version.
         If scene_ids is None, marks all fingerprints.
@@ -1515,18 +1515,18 @@ class RecommendationsDB:
         self,
         stash_scene_id: int,
         frame_index: int,
-        timestamp_sec: Optional[float],
+        timestamp_sec: float | None,
         bbox: dict,
         det_confidence: float,
-        yaw: Optional[float],
+        yaw: float | None,
         facenet_emb: bytes,
         arcface_emb: bytes,
-        crop_path: Optional[str] = None,
-        best_match_id: Optional[str] = None,
-        best_match_name: Optional[str] = None,
-        best_match_confidence: Optional[float] = None,
-        db_version: Optional[str] = None,
-    ) -> Optional[int]:
+        crop_path: str | None = None,
+        best_match_id: str | None = None,
+        best_match_name: str | None = None,
+        best_match_confidence: float | None = None,
+        db_version: str | None = None,
+    ) -> int | None:
         """Insert a per-face record. Returns face ID, or None if duplicate."""
         with self._connection() as conn:
             try:
@@ -1575,7 +1575,7 @@ class RecommendationsDB:
                     break
                 yield [dict(r) for r in rows]
 
-    def get_library_face(self, face_id: int) -> Optional[dict]:
+    def get_library_face(self, face_id: int) -> dict | None:
         with self._connection() as conn:
             row = conn.execute("SELECT * FROM library_faces WHERE id = ?", (face_id,)).fetchone()
             return dict(row) if row else None
@@ -1646,10 +1646,10 @@ class RecommendationsDB:
 
     def create_face_cluster(
         self,
-        name: Optional[str] = None,
+        name: str | None = None,
         status: str = "open",
-        performer_id: Optional[str] = None,
-        performer_name: Optional[str] = None,
+        performer_id: str | None = None,
+        performer_name: str | None = None,
     ) -> int:
         with self._connection() as conn:
             cursor = conn.execute(
@@ -1664,10 +1664,10 @@ class RecommendationsDB:
     def update_face_cluster(
         self,
         cluster_id: int,
-        name: Optional[str] = None,
-        status: Optional[str] = None,
-        performer_id: Optional[str] = None,
-        performer_name: Optional[str] = None,
+        name: str | None = None,
+        status: str | None = None,
+        performer_id: str | None = None,
+        performer_name: str | None = None,
     ) -> bool:
         """Partial update. Only non-None fields change."""
         with self._connection() as conn:
@@ -1695,12 +1695,12 @@ class RecommendationsDB:
             cursor = conn.execute("DELETE FROM face_clusters WHERE id = ?", (cluster_id,))
             return cursor.rowcount > 0
 
-    def get_face_cluster(self, cluster_id: int) -> Optional[dict]:
+    def get_face_cluster(self, cluster_id: int) -> dict | None:
         with self._connection() as conn:
             row = conn.execute("SELECT * FROM face_clusters WHERE id = ?", (cluster_id,)).fetchone()
             return dict(row) if row else None
 
-    def list_face_clusters(self, status: Optional[str] = None) -> list[dict]:
+    def list_face_clusters(self, status: str | None = None) -> list[dict]:
         """List clusters with face counts, largest first."""
         with self._connection() as conn:
             if status:
@@ -1759,8 +1759,8 @@ class RecommendationsDB:
             )
             return cursor.rowcount
 
-    def get_unassigned_face_ids(self, limit: Optional[int] = None) -> list[int]:
-        """Face IDs not yet in any non-ignored cluster."""
+    def get_unassigned_face_ids(self, limit: int | None = None) -> list[int]:
+        """Face IDs not in any live cluster and not banned."""
         with self._connection() as conn:
             query = """
                 SELECT lf.id FROM library_faces lf
@@ -1768,6 +1768,11 @@ class RecommendationsDB:
                     SELECT 1 FROM face_cluster_members m
                     JOIN face_clusters c ON c.id = m.cluster_id
                     WHERE m.face_id = lf.id AND c.status != 'ignored'
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM face_cluster_members m2
+                    JOIN face_clusters c2 ON c2.id = m2.cluster_id
+                    WHERE m2.face_id = lf.id AND c2.status = 'banned'
                 )
                 ORDER BY lf.id
             """
@@ -1836,6 +1841,11 @@ class RecommendationsDB:
                         JOIN face_clusters c ON c.id = m.cluster_id
                         WHERE m.face_id = lf.id AND c.status != 'ignored'
                     )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM face_cluster_members m2
+                        JOIN face_clusters c2 ON c2.id = m2.cluster_id
+                        WHERE m2.face_id = lf.id AND c2.status = 'banned'
+                    )
                     ORDER BY lf.id
                     """
                 )
@@ -1849,7 +1859,7 @@ class RecommendationsDB:
                     break
                 yield [dict(r) for r in rows]
 
-    def get_cluster_centroid(self, cluster_id: int) -> Optional[list]:
+    def get_cluster_centroid(self, cluster_id: int) -> list | None:
         """Mean 1024-d concat embedding of a cluster's faces (None if empty)."""
         import numpy as np
         vecs = []
@@ -1902,9 +1912,9 @@ class RecommendationsDB:
     def create_image_fingerprint(
         self,
         stash_image_id: str,
-        gallery_id: Optional[str] = None,
+        gallery_id: str | None = None,
         faces_detected: int = 0,
-        db_version: Optional[str] = None,
+        db_version: str | None = None,
     ) -> int:
         """
         Create or update an image fingerprint. Returns the fingerprint ID.
@@ -1932,7 +1942,7 @@ class RecommendationsDB:
             )
             return cursor.fetchone()[0]
 
-    def get_image_fingerprint(self, stash_image_id: str) -> Optional[dict]:
+    def get_image_fingerprint(self, stash_image_id: str) -> dict | None:
         """Get an image fingerprint by stash image ID."""
         with self._connection() as conn:
             row = conn.execute(
@@ -1956,12 +1966,12 @@ class RecommendationsDB:
         self,
         stash_image_id: str,
         performer_id: str,
-        confidence: Optional[float] = None,
-        distance: Optional[float] = None,
-        bbox_x: Optional[float] = None,
-        bbox_y: Optional[float] = None,
-        bbox_w: Optional[float] = None,
-        bbox_h: Optional[float] = None,
+        confidence: float | None = None,
+        distance: float | None = None,
+        bbox_x: float | None = None,
+        bbox_y: float | None = None,
+        bbox_w: float | None = None,
+        bbox_h: float | None = None,
     ) -> int:
         """Add or update a face entry in an image fingerprint. Returns the face entry ID."""
         with self._connection() as conn:
@@ -2031,7 +2041,7 @@ class RecommendationsDB:
         scene_b_id: int,
         source: str,
         run_id: int,
-    ) -> Optional[int]:
+    ) -> int | None:
         """Insert a candidate pair. Enforces canonical order (a < b). Returns ID or None if duplicate."""
         a, b = (min(scene_a_id, scene_b_id), max(scene_a_id, scene_b_id))
         with self._connection() as conn:
@@ -2137,7 +2147,7 @@ class RecommendationsDB:
 
     def get_fingerprints_with_faces(
         self,
-        scene_ids: Optional[set[int]] = None,
+        scene_ids: set[int] | None = None,
     ) -> dict:
         """
         Load all complete fingerprints with their faces in a single JOIN query.
@@ -2260,8 +2270,8 @@ class RecommendationsDB:
 
     def submit_job(
         self, type: str, priority: int, triggered_by: str,
-        cursor: Optional[str] = None, items_total: Optional[int] = None,
-    ) -> Optional[int]:
+        cursor: str | None = None, items_total: int | None = None,
+    ) -> int | None:
         """Submit a job to the queue. Returns job ID, or None if duplicate queued."""
         with self._connection() as conn:
             existing = conn.execute(
@@ -2279,13 +2289,13 @@ class RecommendationsDB:
             )
             return cursor_obj.lastrowid
 
-    def get_job(self, job_id: int) -> Optional[dict]:
+    def get_job(self, job_id: int) -> dict | None:
         """Get a single job by ID."""
         with self._connection() as conn:
             row = conn.execute("SELECT * FROM job_queue WHERE id = ?", (job_id,)).fetchone()
             return dict(row) if row else None
 
-    def get_jobs(self, status: Optional[str] = None, type: Optional[str] = None, limit: int = 50) -> list[dict]:
+    def get_jobs(self, status: str | None = None, type: str | None = None, limit: int = 50) -> list[dict]:
         """Get jobs with optional filters."""
         query = "SELECT * FROM job_queue WHERE 1=1"
         params = []
@@ -2344,8 +2354,8 @@ class RecommendationsDB:
         with self._connection() as conn:
             conn.execute("UPDATE job_queue SET status = ? WHERE id = ?", (status, job_id))
 
-    def update_job_progress(self, job_id: int, items_processed: Optional[int] = None,
-                            items_total: Optional[int] = None, cursor: Optional[str] = None):
+    def update_job_progress(self, job_id: int, items_processed: int | None = None,
+                            items_total: int | None = None, cursor: str | None = None):
         """Update job progress fields. Only updates non-None fields."""
         updates = []
         params = []
@@ -2428,7 +2438,7 @@ class RecommendationsDB:
                     (type, interval_hours, priority)
                 )
 
-    def get_job_schedule(self, type: str) -> Optional[dict]:
+    def get_job_schedule(self, type: str) -> dict | None:
         """Get schedule for a job type."""
         with self._connection() as conn:
             row = conn.execute("SELECT * FROM job_schedules WHERE type = ?", (type,)).fetchone()
