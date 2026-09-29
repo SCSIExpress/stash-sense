@@ -518,7 +518,9 @@
       results.innerHTML = '<div class="ss-loading-inline">Searching…</div>';
       try {
         const r = await FaceGroupsAPI.searchPerformers(q);
-        renderResults(r.performers || []);
+        // /stash/search-performers returns a bare array; older shapes may wrap it
+        const list = Array.isArray(r) ? r : (r.performers || []);
+        renderResults(list);
       } catch (e) {
         results.innerHTML = `<p style="opacity:.6;">${esc(e.message)}</p>`;
       }
