@@ -40,6 +40,9 @@
     async rename(clusterId, name) { return apiCall('fg_update', { cluster_id: clusterId, name }); },
     async crop(clusterId, faceId) { return apiCall('fg_crop', { cluster_id: clusterId, face_id: faceId }); },
     async searchPerformers(query) { return apiCall('search_performers', { query }); },
+    async createAndAssign(clusterId, name, opts = {}) {
+      return apiCall('fg_create_and_assign', { cluster_id: clusterId, name, ...opts });
+    },
   };
 
   // ==================== State ====================
@@ -249,7 +252,14 @@
           <button class="ss-modal-close">×</button></div>
         <div class="ss-modal-body">
           <p style="opacity:.8;">All scenes containing faces from this group will be tagged with the chosen performer (scenes keep their existing performers).</p>
-          <input type="text" class="ss-input" id="fg-performer-search" placeholder="Search Stash performers…" style="width:100%;padding:8px;margin-bottom:8px;" />
+          <input type="text" class="ss-input" id="fg-performer-search" placeholder="Search existing performers, or type a new name…" style="width:100%;padding:8px;margin-bottom:8px;" />
+          <div style="display:flex;gap:8px;margin-bottom:8px;">
+            <button class="ss-btn ss-btn-sm ss-btn-primary" id="fg-create-new" disabled>Create new performer</button>
+            <label style="display:flex;align-items:center;gap:4px;font-size:.9em;opacity:.85;">
+              <input type="checkbox" id="fg-new-favorite" /> Favorite
+            </label>
+            <input type="text" class="ss-input" id="fg-new-disambig" placeholder="Disambiguation (optional)" style="flex:1;padding:4px 8px;display:none;" />
+          </div>
           <div id="fg-performer-results" style="max-height:300px;overflow-y:auto;"></div>
         </div>
       </div>`;
@@ -261,11 +271,41 @@
 
     const searchInput = overlay.querySelector('#fg-performer-search');
     const results = overlay.querySelector('#fg-performer-results');
+    const createBtn = overlay.querySelector('#fg-create-new');
+    const favCheck = overlay.querySelector('#fg-new-favorite');
+    const disambigInput = overlay.querySelector('#fg-new-disambig');
     let debounce;
+
+    function wireCreate() {
+      if (!createBtn) return;
+      createBtn.disabled = searchInput.value.trim().length === 0;
+      createBtn.onclick = async () => {
+        const name = searchInput.value.trim();
+        if (!name) return;
+        const orig = createBtn.textContent;
+        createBtn.disabled = true;
+        createBtn.textContent = 'Creating & tagging…';
+        try {
+          const r = await FaceGroupsAPI.createAndAssign(clusterId, name, {
+            favorite: favCheck && favCheck.checked,
+            disambiguation: disambigInput && disambigInput.value.trim() || undefined,
+          });
+          close();
+          alert(`Created performer "${r.created_performer.name}" — tagged ${r.scenes_tagged} scene(s)` +
+                (r.scenes_already_tagged ? `, ${r.scenes_already_tagged} already tagged` : '') +
+                (r.scenes_failed && r.scenes_failed.length ? `, ${r.scenes_failed.length} FAILED` : ''));
+          renderList(container);
+        } catch (e) {
+          alert(`Create failed: ${e.message}`);
+          createBtn.disabled = false;
+          createBtn.textContent = orig;
+        }
+      };
+    }
 
     function renderResults(list) {
       if (!list.length) {
-        results.innerHTML = '<p style="opacity:.6;padding:8px;">No performers found — create one in Stash first.</p>';
+        results.innerHTML = '<p style="opacity:.6;padding:8px;">No existing performer matches — use "Create new performer" above.</p>';
         return;
       }
       results.innerHTML = list.map(p => `
@@ -308,7 +348,13 @@
     searchInput.addEventListener('input', () => {
       clearTimeout(debounce);
       debounce = setTimeout(doSearch, 350);
+      // Create-new affordance: any non-empty input is a candidate new performer
+      if (createBtn) {
+        createBtn.style.display = '';
+        wireCreate();
+      }
     });
+    wireCreate();
     searchInput.focus();
   }
 

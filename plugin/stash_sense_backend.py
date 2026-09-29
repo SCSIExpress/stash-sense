@@ -379,6 +379,13 @@ def handle_face_groups(mode, args, sidecar_url):
             "performer_id": args["performer_id"],
             "performer_name": args["performer_name"],
         }, timeout=600)
+    elif mode == "fg_create_and_assign":
+        payload = {"name": args["name"]}
+        if args.get("disambiguation"):
+            payload["disambiguation"] = args["disambiguation"]
+        if args.get("favorite"):
+            payload["favorite"] = True
+        return sidecar_post(sidecar_url, f"/face-groups/{args['cluster_id']}/create-and-assign", payload, timeout=600)
     elif mode == "fg_ignore":
         return sidecar_post(sidecar_url, f"/face-groups/{args['cluster_id']}/ignore")
     elif mode == "fg_delete":

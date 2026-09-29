@@ -44,6 +44,12 @@ class AssignPerformerRequest(BaseModel):
     performer_name: str = Field(description="Performer name (denormalized for display)")
 
 
+class CreateAndAssignRequest(BaseModel):
+    name: str = Field(min_length=1, description="Name for the new Stash performer")
+    disambiguation: str | None = Field(None, description="Optional disambiguation string")
+    favorite: bool = Field(False, description="Mark performer as favorite")
+
+
 class MergeClustersRequest(BaseModel):
     source_ids: list[int] = Field(description="Cluster IDs to merge from")
     target_id: int = Field(description="Cluster ID to merge into")
@@ -147,6 +153,35 @@ async def assign_performer(cluster_id: int, req: AssignPerformerRequest):
     except Exception as e:
         logger.exception("assign_performer failed")
         raise HTTPException(500, str(e))
+
+
+@router.post("/{cluster_id}/create-and-assign")
+async def create_performer_and_assign(cluster_id: int, req: CreateAndAssignRequest):
+    """Create a NEW Stash performer named `name`, then assign the cluster to it
+    (bulk-tags every scene containing the group's faces). For personal content
+    with performers that aren't in the big DBs."""
+    db = get_rec_db()
+    if db.get_face_cluster(cluster_id) is None:
+        raise HTTPException(404, f"cluster {cluster_id} not found")
+    stash = get_stash_client()
+    try:
+        created = stash.create_performer_sync(
+            req.name,
+            **({"disambiguation": req.disambiguation} if req.disambiguation else {}),
+            **({"favorite": True} if req.favorite else {}),
+        )
+    except Exception as e:
+        logger.exception("performerCreate failed")
+        raise HTTPException(500, f"failed to create performer: {e}")
+
+    service = get_face_cluster_service()
+    try:
+        result = service.assign_performer(cluster_id, created["id"], created["name"], stash)
+    except Exception as e:
+        logger.exception("assign after create failed")
+        raise HTTPException(500, f"performer created ({created['id']}) but assignment failed: {e}")
+
+    return {"created_performer": created, **result}
 
 
 @router.post("/{cluster_id}/ignore")

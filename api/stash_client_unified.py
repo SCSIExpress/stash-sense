@@ -497,6 +497,20 @@ class StashClientUnified:
         """
         self._execute_sync(query, {"id": scene_id, "performer_ids": performer_ids})
 
+    def create_performer_sync(self, name: str, **extra) -> dict:
+        """Create a new performer in Stash (synchronous). Returns {id, name}."""
+        input_fields = {"name": name, **extra}
+        query = """
+        mutation PerformerCreate($input: PerformerCreateInput!) {
+          performerCreate(input: $input) {
+            id
+            name
+          }
+        }
+        """
+        data = self._execute_sync(query, {"input": input_fields})
+        return data["performerCreate"]
+
     async def update_image_performers(self, image_id: str, performer_ids: list[str]) -> None:
         """Update the performers for an image."""
         query = """
