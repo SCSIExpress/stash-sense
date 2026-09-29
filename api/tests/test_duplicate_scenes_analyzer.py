@@ -246,10 +246,10 @@ class TestDuplicateCandidatesDB:
             ).fetchone()
             assert row is not None
 
-    def test_schema_version_is_10(self, db):
+    def test_schema_version_is_11(self, db):
         with db._connection() as conn:
             version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-            assert version == 10
+            assert version == 11
 
     def test_insert_candidate(self, db):
         """Insert a candidate pair."""

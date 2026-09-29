@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional, Iterator, Any
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 @dataclass
@@ -353,6 +353,13 @@ class RecommendationsDB:
             );
             CREATE INDEX IF NOT EXISTS idx_fc_members_cluster ON face_cluster_members(cluster_id);
             CREATE INDEX IF NOT EXISTS idx_fc_members_face ON face_cluster_members(face_id);
+
+            -- Durable merge history: source groups folded into a target.
+            CREATE TABLE IF NOT EXISTS face_cluster_merge_log (
+                source_cluster_id INTEGER PRIMARY KEY,
+                target_cluster_id INTEGER NOT NULL,
+                merged_at TEXT DEFAULT (datetime('now'))
+            );
         """)
 
     def _migrate_schema(self, conn: sqlite3.Connection, from_version: int):
@@ -576,6 +583,18 @@ class RecommendationsDB:
                 CREATE INDEX IF NOT EXISTS idx_fc_members_face ON face_cluster_members(face_id);
 
                 UPDATE schema_version SET version = 10;
+            """)
+
+        if from_version < 11:
+            conn.executescript("""
+                -- Durable merge history: source groups that were folded into a target.
+                CREATE TABLE IF NOT EXISTS face_cluster_merge_log (
+                    source_cluster_id INTEGER PRIMARY KEY,
+                    target_cluster_id INTEGER NOT NULL,
+                    merged_at TEXT DEFAULT (datetime('now'))
+                );
+
+                UPDATE schema_version SET version = 11;
             """)
 
     @contextmanager
@@ -1777,6 +1796,106 @@ class RecommendationsDB:
             for cluster_id, face_id in rows:
                 mapping.setdefault(face_id, []).append(cluster_id)
             return mapping
+
+    def record_cluster_merge(self, source_ids: list[int], target_id: int) -> None:
+        """Remember that source clusters were merged into target (for rebuilds)."""
+        with self._connection() as conn:
+            for sid in source_ids:
+                conn.execute(
+                    "INSERT OR REPLACE INTO face_cluster_merge_log (source_cluster_id, target_cluster_id) VALUES (?, ?)",
+                    (sid, target_id)
+                )
+
+    def get_cluster_merge_map(self) -> dict[int, int]:
+        """Map of source_cluster_id -> target_cluster_id (follows chains)."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT source_cluster_id, target_cluster_id FROM face_cluster_merge_log"
+            ).fetchall()
+            mapping = dict(rows)
+        # Resolve chains: source -> mid -> target
+        for src in mapping:
+            seen = set()
+            dst = mapping[src]
+            while dst in mapping and dst not in seen:
+                seen.add(dst)
+                dst = mapping[dst]
+            mapping[src] = dst
+        return mapping
+
+    def iter_library_faces(self, unassigned_only: bool = False, batch_size: int = 500) -> Iterator[list[dict]]:
+        """Iterate all library faces (or only unassigned ones) in batches."""
+        with self._connection() as conn:
+            if unassigned_only:
+                cursor = conn.execute(
+                    """
+                    SELECT lf.id, lf.facenet_emb, lf.arcface_emb, lf.best_match_id, lf.stash_scene_id
+                    FROM library_faces lf
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM face_cluster_members m
+                        JOIN face_clusters c ON c.id = m.cluster_id
+                        WHERE m.face_id = lf.id AND c.status != 'ignored'
+                    )
+                    ORDER BY lf.id
+                    """
+                )
+            else:
+                cursor = conn.execute(
+                    "SELECT id, facenet_emb, arcface_emb, best_match_id, stash_scene_id FROM library_faces ORDER BY id"
+                )
+            while True:
+                rows = cursor.fetchmany(batch_size)
+                if not rows:
+                    break
+                yield [dict(r) for r in rows]
+
+    def get_cluster_centroid(self, cluster_id: int) -> Optional[list]:
+        """Mean 1024-d concat embedding of a cluster's faces (None if empty)."""
+        import numpy as np
+        vecs = []
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT lf.facenet_emb, lf.arcface_emb
+                FROM face_cluster_members m
+                JOIN library_faces lf ON lf.id = m.face_id
+                WHERE m.cluster_id = ?
+                """,
+                (cluster_id,)
+            ).fetchall()
+        for fn, af in rows:
+            vecs.append(np.concatenate([
+                np.frombuffer(fn, dtype=np.float32),
+                np.frombuffer(af, dtype=np.float32),
+            ]))
+        if not vecs:
+            return None
+        mean = np.mean(np.stack(vecs), axis=0)
+        norm = np.linalg.norm(mean)
+        if norm == 0:
+            return None
+        return (mean / norm).astype(np.float32)
+
+    def get_clusters_by_status(self, *statuses: str) -> list[dict]:
+        """Clusters with any of the given statuses, with face counts."""
+        placeholders = ",".join("?" * len(statuses))
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT c.*, COUNT(m.face_id) AS face_count,
+                       (SELECT COUNT(DISTINCT lf.stash_scene_id)
+                        FROM face_cluster_members mm
+                        JOIN library_faces lf ON lf.id = mm.face_id
+                        WHERE mm.cluster_id = c.id) AS scene_count
+                FROM face_clusters c
+                LEFT JOIN face_cluster_members m ON m.cluster_id = c.id
+                WHERE c.status IN ({placeholders})
+                GROUP BY c.id
+                ORDER BY face_count DESC
+                """,
+                list(statuses)
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     # ==================== Image Fingerprints ====================
 

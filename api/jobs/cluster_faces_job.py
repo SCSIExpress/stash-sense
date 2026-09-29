@@ -45,6 +45,7 @@ class ClusterLibraryFacesJob(BaseJob):
             min_cluster_size=min_size,
             seed_by_match=True,
             replace_existing=True,
+            incremental=True,
         )
         await context.report_progress(result.get("faces_total", total), max(1, total))
         return None

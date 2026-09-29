@@ -29,7 +29,7 @@
   const FaceGroupsAPI = {
     async list(status) { return apiCall('fg_list', status ? { status } : {}); },
     async get(clusterId) { return apiCall('fg_get', { cluster_id: clusterId }); },
-    async build(opts = {}) { return apiCall('fg_build', opts); },
+    async build(opts = {}) { return apiCall('fg_build', { incremental: true, auto_tag: true, replace_existing: true, ...opts }); },
     async stats() { return apiCall('fg_stats'); },
     async assign(clusterId, performerId, performerName) {
       return apiCall('fg_assign', { cluster_id: clusterId, performer_id: performerId, performer_name: performerName });
@@ -361,11 +361,14 @@
   // ==================== Rebuild ====================
 
   async function rebuildGroups(container) {
-    if (!confirm('Rebuild face groups?\n\nOpen (unnamed) groups are re-clustered from all stored faces. Assigned and ignored groups are kept.')) return;
+    if (!confirm('Update face groups?\n\nIncremental: new faces are matched against existing groups (assigned, matched, and open) by similarity and absorbed when close enough — scenes of faces absorbed into assigned groups are auto-tagged with that group\'s performer. Leftover faces form new open groups.')) return;
     rebuildGroupsInProgress(container);
     try {
-      const r = await FaceGroupsAPI.build({ replace_existing: true });
-      alert(`Built ${r.clusters_created} groups covering ${r.faces_assigned} of ${r.faces_total} faces.`);
+      const r = await FaceGroupsAPI.build({ incremental: true, auto_tag: true, replace_existing: true });
+      const parts = [`absorbed ${r.absorbed} new face(s) into ${r.groups_absorbed_into} existing group(s)`];
+      if (r.tagged_scenes) parts.push(`auto-tagged ${r.tagged_scenes} scene(s)`);
+      if (r.clusters_created) parts.push(`created ${r.clusters_created} new group(s)`);
+      alert(`Face groups updated: ${parts.join('; ')}.`);
     } catch (e) {
       alert(`Rebuild failed: ${e.message}`);
     }

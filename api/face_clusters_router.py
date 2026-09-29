@@ -37,6 +37,8 @@ class BuildClustersRequest(BaseModel):
     min_cluster_size: int = Field(3, ge=1, le=100)
     seed_by_match: bool = True
     replace_existing: bool = False
+    incremental: bool = Field(False, description="Only cluster faces not already in a group; absorb close ones into existing groups by centroid")
+    auto_tag: bool = Field(False, description="With incremental: auto-tag scenes of faces absorbed into assigned groups")
 
 
 class AssignPerformerRequest(BaseModel):
@@ -97,14 +99,18 @@ async def list_clusters(
 
 @router.post("/build")
 async def build_clusters(req: BuildClustersRequest):
-    """Cluster all library faces. Long-running for large libraries."""
+    """Cluster library faces. Long-running for large libraries."""
     service = get_face_cluster_service()
+    stash = get_stash_client() if (req.incremental and req.auto_tag) else None
     try:
         return service.build_clusters(
             distance_threshold=req.distance_threshold,
             min_cluster_size=req.min_cluster_size,
             seed_by_match=req.seed_by_match,
             replace_existing=req.replace_existing,
+            incremental=req.incremental,
+            auto_tag=req.auto_tag,
+            stash_client=stash,
         )
     except Exception as e:
         logger.exception("build_clusters failed")

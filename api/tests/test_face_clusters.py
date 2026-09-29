@@ -262,3 +262,106 @@ class TestBuildClustersService:
         assert result["faces_moved"] == 1
         assert db.get_face_cluster(c1) is None
         assert db.get_cluster_face_count(c2) == 2
+
+
+class TestIncrementalClustering:
+    def test_new_faces_absorb_into_assigned_group(self, db):
+        from face_cluster_service import FaceClusterService
+        svc = FaceClusterService(db)
+
+        # Base person: two faces assigned to performer-9
+        base_fn = _emb_bytes(555)
+        base_af = _emb_bytes(556)
+        f1 = _add_face(db, scene_id=1, match_id="p9", match_name="Jane")
+        f2 = _add_face(db, scene_id=2, facenet=_similar_emb(base_fn, seed=1), arcface=_similar_emb(base_af, seed=1))
+        cid = db.create_face_cluster(status="assigned", performer_id="p9", performer_name="Jane")
+        db.add_faces_to_cluster(cid, [f1, f2])
+
+        # New similar face, no match anchor
+        f3 = _add_face(db, scene_id=3, facenet=_similar_emb(base_fn, seed=2), arcface=_similar_emb(base_af, seed=2))
+
+        result = svc.build_clusters(incremental=True)
+        assert result["mode"] == "incremental"
+        assert result["absorbed"] == 1
+        assert f3 in db.get_cluster_scene_ids(cid) or db.get_cluster_face_count(cid) == 3
+
+    def test_auto_tag_absorbed_scenes(self, db):
+        from face_cluster_service import FaceClusterService
+        svc = FaceClusterService(db)
+
+        base_fn = _emb_bytes(444)
+        base_af = _emb_bytes(445)
+        f1 = _add_face(db, scene_id=1, facenet=base_fn, arcface=base_af)
+        cid = db.create_face_cluster(status="assigned", performer_id="p9", performer_name="Jane")
+        db.add_faces_to_cluster(cid, [f1])
+
+        f2 = _add_face(db, scene_id=7, facenet=_similar_emb(base_fn, seed=3), arcface=_similar_emb(base_af, seed=3))
+
+        tagged = []
+
+        class FakeStash:
+            def get_scene_performer_ids_sync(self, scene_id):
+                return {"id": scene_id, "performer_ids": []}
+            def update_scene_performers_sync(self, scene_id, performer_ids):
+                tagged.append((scene_id, performer_ids))
+
+        result = svc.build_clusters(incremental=True, auto_tag=True, stash_client=FakeStash())
+        assert result["tagged_scenes"] == 1
+        assert ("7", ["p9"]) in tagged
+
+    def test_dissimilar_faces_form_new_group(self, db):
+        from face_cluster_service import FaceClusterService
+        svc = FaceClusterService(db)
+
+        f1 = _add_face(db, scene_id=1, facenet=_emb_bytes(444), arcface=_emb_bytes(445))
+        cid = db.create_face_cluster(status="assigned", performer_id="p9", performer_name="Jane")
+        db.add_faces_to_cluster(cid, [f1])
+
+        # similar-to-each-other but dissimilar-from-group new faces
+        base = _emb_bytes(8888)
+        for i in range(4):
+            _add_face(db, scene_id=10 + i, facenet=_similar_emb(base, seed=10 + i), arcface=_similar_emb(_emb_bytes(8889), seed=10 + i))
+
+        result = svc.build_clusters(incremental=True, min_cluster_size=3)
+        assert result["absorbed"] == 0
+        assert result["clusters_created"] == 1
+
+    def test_merge_is_recorded(self, db):
+        from face_cluster_service import FaceClusterService
+        svc = FaceClusterService(db)
+        f1 = _add_face(db, scene_id=1)
+        c1 = db.create_face_cluster()
+        c2 = db.create_face_cluster()
+        db.add_faces_to_cluster(c1, [f1])
+        svc.merge_clusters([c1], c2)
+        mmap = db.get_cluster_merge_map()
+        assert mmap[c1] == c2
+        assert db.get_face_cluster(c1) is None
+
+    def test_merge_chain_resolution(self, db):
+        db.record_cluster_merge([1], 2)
+        db.record_cluster_merge([2], 3)
+        mmap = db.get_cluster_merge_map()
+        assert mmap[1] == 3
+
+    def test_full_rebuild_grows_assigned_group(self, db):
+        from face_cluster_service import FaceClusterService
+        svc = FaceClusterService(db)
+
+        f1 = _add_face(db, scene_id=1, match_id="p9", match_name="Jane")
+        cid = db.create_face_cluster(status="assigned", performer_id="p9", performer_name="Jane")
+        db.add_faces_to_cluster(cid, [f1])
+
+        # new face, same match anchor
+        f2 = _add_face(db, scene_id=2, match_id="p9", match_name="Jane")
+
+        svc.build_clusters(replace_existing=True)  # full build
+        assert db.get_cluster_face_count(cid) == 2
+        assert db.get_face_cluster(cid)["status"] == "assigned"
+
+    def test_schema_v11(self, db):
+        with db._connection() as conn:
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            assert version == 11
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            assert "face_cluster_merge_log" in tables

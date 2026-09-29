@@ -20,22 +20,49 @@ class FaceClusterService:
         min_cluster_size: int = 3,
         seed_by_match: bool = True,
         replace_existing: bool = False,
+        incremental: bool = False,
+        auto_tag: bool = False,
+        stash_client=None,
     ) -> dict:
-        """Cluster all unassigned library faces.
+        """Cluster library faces.
 
-        Known-performer faces (best_match set at identify time) are grouped
-        directly by their match ID (seed anchors); the remaining faces are
-        clustered by embedding similarity.
+        Modes:
+        - Full build (default): cluster ALL faces from scratch. `replace_existing`
+          clears open groups first. Existing assigned/ignored groups are re-seeded
+          by anchor so their membership is recovered from scratch.
+        - Incremental (incremental=True): only faces not already in a live group
+          are clustered. They are first matched against the centroids of existing
+          groups (assigned, matched, open — closest centroid within threshold
+          wins); leftovers form new open groups. This is how new matches "pick up"
+          existing groups, including groups you've assigned or merged.
 
-        Args:
-            distance_threshold: max cosine distance for union.
-            min_cluster_size: smaller similarity clusters are dropped (not stored).
-            seed_by_match: group faces with the same best_match_id first.
-            replace_existing: delete existing 'open' clusters first.
+        With auto_tag=True (incremental only), faces absorbed into an assigned
+        group trigger tagging of their scenes for that group's performer.
 
         Returns:
-            {"clusters_created", "faces_assigned", "faces_total"}
+            {"clusters_created", "faces_assigned", "faces_total", ...mode-specific extras}
         """
+        if incremental:
+            return self._build_incremental(
+                distance_threshold=distance_threshold,
+                min_cluster_size=min_cluster_size,
+                auto_tag=auto_tag,
+                stash_client=stash_client,
+            )
+        return self._build_full(
+            distance_threshold=distance_threshold,
+            min_cluster_size=min_cluster_size,
+            seed_by_match=seed_by_match,
+            replace_existing=replace_existing,
+        )
+
+    def _build_full(
+        self,
+        distance_threshold: float,
+        min_cluster_size: int,
+        seed_by_match: bool,
+        replace_existing: bool,
+    ) -> dict:
         total = self.db.get_library_face_count()
         if total == 0:
             return {"clusters_created": 0, "faces_assigned": 0, "faces_total": 0}
@@ -52,7 +79,10 @@ class FaceClusterService:
         assigned = 0
         created = 0
 
-        # Pass 1: seed clusters from identify-time matches
+        # Pass 1: seed clusters from identify-time matches.
+        # Faces whose match equals an existing assigned group's performer join
+        # that group (rebuilds grow assigned groups); otherwise a matched group
+        # is (re)created.
         by_match: dict[str, list[int]] = {}
         unmatched_faces: list[dict] = []
         if seed_by_match:
@@ -65,10 +95,22 @@ class FaceClusterService:
         else:
             unmatched_faces = faces
 
+        # Map performer_id -> existing assigned group
+        assigned_groups = {}
+        for c in self.db.get_clusters_by_status("assigned"):
+            if c.get("performer_id"):
+                assigned_groups[c["performer_id"]] = c["id"]
+
         for mid, face_ids in by_match.items():
             if len(face_ids) == 0:
                 continue
-            sample = next(f for f in faces if f["id"] == face_ids[0])
+            # Faces whose performer already has an assigned group join it;
+            # otherwise a fresh matched group is created for this rebuild.
+            existing = assigned_groups.get(mid)
+            if existing is not None:
+                self.db.add_faces_to_cluster(existing, face_ids)
+                assigned += len(face_ids)
+                continue
             name = None
             # best_match_name isn't in iter batch; fetch from one face row
             face_row = self.db.get_library_face(face_ids[0])
@@ -96,6 +138,124 @@ class FaceClusterService:
                 assigned += len(cluster_face_ids)
 
         return {"clusters_created": created, "faces_assigned": assigned, "faces_total": total}
+
+    def _build_incremental(
+        self,
+        distance_threshold: float,
+        min_cluster_size: int,
+        auto_tag: bool,
+        stash_client=None,
+    ) -> dict:
+        """Cluster only new (unassigned) faces; absorb close ones into existing
+        groups by centroid proximity. New small groups stay open; faces absorbed
+        into an assigned group can auto-tag their scenes."""
+        import numpy as np
+
+        total = self.db.get_library_face_count()
+        new_faces: list[dict] = []
+        for batch in self.db.iter_library_faces(unassigned_only=True):
+            new_faces.extend(batch)
+
+        if not new_faces:
+            return {
+                "mode": "incremental", "clusters_created": 0, "faces_assigned": 0,
+                "faces_total": total, "absorbed": 0, "tagged_scenes": 0,
+            }
+
+        # Existing live groups (assigned, matched, open) with their centroids
+        live = [c for c in self.db.get_clusters_by_status("assigned", "matched", "open")
+                if c["face_count"] > 0]
+        centroids: dict[int, np.ndarray] = {}
+        for c in live:
+            vec = self.db.get_cluster_centroid(c["id"])
+            if vec is not None:
+                centroids[c["id"]] = vec
+
+        status_of = {c["id"]: c["status"] for c in live}
+        performer_of = {c["id"]: (c["performer_id"], c["performer_name"]) for c in live}
+
+        absorbed_by: dict[int, list[int]] = {}  # cluster_id -> face ids
+        leftovers: list[dict] = []
+
+        # Pass 1: seed-by-match — faces whose identify-time match equals an
+        # existing group's performer join that group outright.
+        # Pass 2: centroid proximity for the rest.
+        for f in new_faces:
+            placed = False
+            mid = f.get("best_match_id")
+            if mid:
+                for cid, (pid, _pname) in performer_of.items():
+                    if pid == mid:
+                        absorbed_by.setdefault(cid, []).append(f["id"])
+                        placed = True
+                        break
+            if placed:
+                continue
+            fn = np.frombuffer(f["facenet_emb"], dtype=np.float32)
+            af = np.frombuffer(f["arcface_emb"], dtype=np.float32)
+            v = np.concatenate([fn, af])
+            norm = np.linalg.norm(v)
+            if norm > 0:
+                v = v / norm
+                best_cid, best_d = None, float("inf")
+                for cid, cent in centroids.items():
+                    d = 1.0 - float(np.dot(v, cent))
+                    if d < best_d:
+                        best_d, best_cid = d, cid
+                if best_cid is not None and best_d <= distance_threshold:
+                    absorbed_by.setdefault(best_cid, []).append(f["id"])
+                    placed = True
+            if not placed:
+                leftovers.append(f)
+
+        absorbed = 0
+        tagged_scenes = 0
+
+        for cid, face_ids in absorbed_by.items():
+            self.db.add_faces_to_cluster(cid, face_ids)
+            absorbed += len(face_ids)
+            # refresh centroid with the new members
+            new_cent = self.db.get_cluster_centroid(cid)
+            if new_cent is not None:
+                centroids[cid] = new_cent
+            # auto-tag newly absorbed faces' scenes for assigned groups
+            if auto_tag and status_of.get(cid) == "assigned" and stash_client is not None:
+                pid, pname = performer_of.get(cid, (None, None))
+                if pid:
+                    for fid in face_ids:
+                        face = self.db.get_library_face(fid)
+                        if face is None:
+                            continue
+                        sid = str(face["stash_scene_id"])
+                        try:
+                            scene = stash_client.get_scene_performer_ids_sync(sid)
+                            if scene is None:
+                                continue
+                            current = scene.get("performer_ids") or []
+                            if pid not in current:
+                                stash_client.update_scene_performers_sync(sid, [*current, pid])
+                                tagged_scenes += 1
+                        except Exception:
+                            logger.exception("auto-tag failed for scene %s", sid)
+
+        # Pass 3: leftovers form new open groups
+        created = 0
+        if leftovers:
+            from library_clustering import cluster_library_faces
+            for cluster_face_ids in cluster_library_faces(leftovers, distance_threshold):
+                if len(cluster_face_ids) < min_cluster_size:
+                    continue
+                cid = self.db.create_face_cluster(status="open")
+                self.db.add_faces_to_cluster(cid, cluster_face_ids)
+                created += 1
+
+        return {
+            "mode": "incremental", "clusters_created": created,
+            "faces_assigned": absorbed + sum(1 for _ in leftovers),
+            "faces_total": total, "faces_new": len(new_faces),
+            "absorbed": absorbed, "groups_absorbed_into": len(absorbed_by),
+            "tagged_scenes": tagged_scenes,
+        }
 
     def assign_performer(
         self,
@@ -150,7 +310,12 @@ class FaceClusterService:
         }
 
     def merge_clusters(self, source_ids: list[int], target_id: int) -> dict:
-        """Move all faces from source clusters into target; delete sources."""
+        """Move all faces from source clusters into target; delete sources.
+
+        The merge is recorded in face_cluster_merge_log so rebuilds can
+        re-route: if a deleted source's identity would re-form (same seed
+        match), its faces are redirected to the surviving target instead.
+        """
         total_moved = 0
         for sid in source_ids:
             if sid == target_id:
@@ -161,12 +326,7 @@ class FaceClusterService:
             self.db.delete_face_cluster(sid)
             total_moved += len(face_ids)
 
-        # Merge metadata: keep target performer info if present, else adopt source's
-        target = self.db.get_face_cluster(target_id)
-        if target and not target.get("performer_id"):
-            # find any surviving source metadata (they're deleted, so nothing to adopt;
-            # caller should set performer info explicitly if wanted)
-            pass
+        self.db.record_cluster_merge(source_ids, target_id)
 
         return {"target_id": target_id, "merged_sources": source_ids, "faces_moved": total_moved}
 

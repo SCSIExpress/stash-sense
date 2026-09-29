@@ -371,6 +371,8 @@ def handle_face_groups(mode, args, sidecar_url):
             "min_cluster_size": args.get("min_cluster_size", 3),
             "seed_by_match": args.get("seed_by_match", True),
             "replace_existing": args.get("replace_existing", True),
+            "incremental": args.get("incremental", False),
+            "auto_tag": args.get("auto_tag", False),
         }, timeout=600)
     elif mode == "fg_stats":
         return sidecar_get(sidecar_url, "/face-groups/stats")
