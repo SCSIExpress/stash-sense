@@ -395,7 +395,7 @@ def handle_face_groups(mode, args, sidecar_url):
     elif mode == "fg_eject":
         return sidecar_post(sidecar_url, f"/face-groups/{args['cluster_id']}/eject", {
             "face_ids": args["face_ids"],
-            "mode": args.get("mode", "eject"),
+            "eject_mode": args.get("eject_mode", "eject"),
         })
     elif mode == "fg_unban":
         return sidecar_post(sidecar_url, "/face-groups/unban", {"face_ids": args["face_ids"]})

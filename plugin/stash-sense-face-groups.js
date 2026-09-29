@@ -39,7 +39,9 @@
     async merge(sourceIds, targetId) { return apiCall('fg_merge', { source_ids: sourceIds, target_id: targetId }); },
     async rename(clusterId, name) { return apiCall('fg_update', { cluster_id: clusterId, name }); },
     async crop(clusterId, faceId) { return apiCall('fg_crop', { cluster_id: clusterId, face_id: faceId }); },
-    async eject(clusterId, faceIds, mode) { return apiCall('fg_eject', { cluster_id: clusterId, face_ids: faceIds, mode }); },
+    // NB: never pass a key named `mode` in params — runPluginOperation builds
+    // {mode, ...params} and the spread would overwrite the operation mode.
+    async eject(clusterId, faceIds, ejectMode) { return apiCall('fg_eject', { cluster_id: clusterId, face_ids: faceIds, eject_mode: ejectMode }); },
     async unban(faceIds) { return apiCall('fg_unban', { face_ids: faceIds }); },
     async banned() { return apiCall('fg_banned'); },
     async searchPerformers(query) { return apiCall('search_performers', { query }); },

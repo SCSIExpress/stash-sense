@@ -71,7 +71,7 @@ class FaceIdsRequest(BaseModel):
 
 
 class EjectRequest(FaceIdsRequest):
-    mode: str = Field("eject", description="eject (back to pool) or ban (never cluster again)")
+    eject_mode: str = Field("eject", description="eject (back to pool) or ban (never cluster again)")
 
 
 class ClusterOut(BaseModel):
@@ -238,7 +238,7 @@ async def eject_faces(cluster_id: int, req: EjectRequest):
     db = get_rec_db()
     if db.get_face_cluster(cluster_id) is None:
         raise HTTPException(404, f"cluster {cluster_id} not found")
-    if req.mode == "ban":
+    if req.eject_mode == "ban":
         held = service.ban_faces(req.face_ids)
         service.eject_faces(cluster_id, req.face_ids)  # also clears membership
         return {"banned": held}
