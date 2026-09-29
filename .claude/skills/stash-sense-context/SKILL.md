@@ -109,9 +109,12 @@ Translation: `recommendations_router.py:update_performer_fields()`
 
 ## Related Skills
 
-- `stash:deploy-stash-sense`: copy the plugin files to production Stash (typed only)
+Typed-only skills are ones I run; suggest them rather than calling them.
+
+- `/stash:deploy-stash-sense` (typed only): copy the plugin files to production Stash
+- `/stash:create-ticket` (typed only): plan and create GitHub Issues
+- `/stash:work-ticket` (typed only): pick up and implement a GitHub Issue
 - `db-import-export`: copy the face DB from the trainer to the sidecar
-- `stash:create-ticket`: plan and create GitHub Issues
-- `stash:work-ticket`: pick up and implement a GitHub Issue
 - `fluffer:git-pr`: branching, commits, PR conventions
-- `stash:stash` / `stash:stash-box` / `stash:stash-plugin-dev`: Stash ecosystem references
+- `stash:stash` / `stash:stash-box`: the Stash and StashDB API references
+- `stash:stash-plugin-dev`: the plugin manifest and PluginApi reference; its deploy and publish steps are for the stash-plugins repo, not this one
