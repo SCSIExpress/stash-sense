@@ -434,4 +434,6 @@
   }
 
   window.StashSenseFaceGroups = { init };
+
+  init();
 })();
