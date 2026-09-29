@@ -352,6 +352,7 @@ class TestJobRegistry:
             "scene_fingerprint_match",
             "fingerprint_generation",
             "database_update",
+            "cluster_library_faces",
         }
         assert set(JOB_REGISTRY.keys()) == expected
 

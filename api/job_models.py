@@ -262,6 +262,18 @@ _register(
 )
 
 _register(
+    "cluster_library_faces",
+    "Face Group Clustering",
+    "Groups library faces by similarity into browsable face groups",
+    ResourceType.LIGHT,
+    JobPriority.NORMAL,
+    supports_incremental=False,
+    schedulable=True,
+    default_interval_hours=168,
+    allowed_intervals=INTERVALS_INFREQUENT,
+)
+
+_register(
     "fingerprint_generation",
     "Fingerprint Generation",
     "Generates face recognition fingerprints for scenes",

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional, Iterator, Any
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 @dataclass
@@ -309,6 +309,50 @@ class RecommendationsDB:
                 last_run_at TEXT,
                 next_run_at TEXT
             );
+
+            -- Per-face persistence for Immich-style face grouping.
+            CREATE TABLE IF NOT EXISTS library_faces (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                stash_scene_id INTEGER NOT NULL,
+                frame_index INTEGER NOT NULL,
+                timestamp_sec REAL,
+                bbox_x REAL NOT NULL,
+                bbox_y REAL NOT NULL,
+                bbox_w REAL NOT NULL,
+                bbox_h REAL NOT NULL,
+                det_confidence REAL NOT NULL,
+                yaw REAL,
+                facenet_emb BLOB NOT NULL,
+                arcface_emb BLOB NOT NULL,
+                crop_path TEXT,
+                best_match_id TEXT,
+                best_match_name TEXT,
+                best_match_confidence REAL,
+                db_version TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(stash_scene_id, frame_index, bbox_x, bbox_y)
+            );
+            CREATE INDEX IF NOT EXISTS idx_lib_faces_scene ON library_faces(stash_scene_id);
+            CREATE INDEX IF NOT EXISTS idx_lib_faces_match ON library_faces(best_match_id);
+
+            -- User-curated face groups.
+            CREATE TABLE IF NOT EXISTS face_clusters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
+                performer_id TEXT,
+                performer_name TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS face_cluster_members (
+                cluster_id INTEGER NOT NULL REFERENCES face_clusters(id) ON DELETE CASCADE,
+                face_id INTEGER NOT NULL REFERENCES library_faces(id) ON DELETE CASCADE,
+                UNIQUE(cluster_id, face_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_fc_members_cluster ON face_cluster_members(cluster_id);
+            CREATE INDEX IF NOT EXISTS idx_fc_members_face ON face_cluster_members(face_id);
         """)
 
     def _migrate_schema(self, conn: sqlite3.Connection, from_version: int):
@@ -481,6 +525,57 @@ class RecommendationsDB:
                 ALTER TABLE analysis_watermarks ADD COLUMN logic_version INTEGER DEFAULT 1;
 
                 UPDATE schema_version SET version = 9;
+            """)
+
+        if from_version < 10:
+            conn.executescript("""
+                -- Per-face persistence for Immich-style face grouping.
+                -- One row per detected face across the whole library.
+                CREATE TABLE IF NOT EXISTS library_faces (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stash_scene_id INTEGER NOT NULL,
+                    frame_index INTEGER NOT NULL,
+                    timestamp_sec REAL,
+                    bbox_x REAL NOT NULL,
+                    bbox_y REAL NOT NULL,
+                    bbox_w REAL NOT NULL,
+                    bbox_h REAL NOT NULL,
+                    det_confidence REAL NOT NULL,
+                    yaw REAL,
+                    facenet_emb BLOB NOT NULL,
+                    arcface_emb BLOB NOT NULL,
+                    crop_path TEXT,
+                    best_match_id TEXT,
+                    best_match_name TEXT,
+                    best_match_confidence REAL,
+                    db_version TEXT,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    UNIQUE(stash_scene_id, frame_index, bbox_x, bbox_y)
+                );
+                CREATE INDEX IF NOT EXISTS idx_lib_faces_scene ON library_faces(stash_scene_id);
+                CREATE INDEX IF NOT EXISTS idx_lib_faces_match ON library_faces(best_match_id);
+
+                -- User-curated face groups (the Immich-style "unnamed person" buckets).
+                CREATE TABLE IF NOT EXISTS face_clusters (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    performer_id TEXT,
+                    performer_name TEXT,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now'))
+                );
+
+                -- Faces assigned to clusters.
+                CREATE TABLE IF NOT EXISTS face_cluster_members (
+                    cluster_id INTEGER NOT NULL REFERENCES face_clusters(id) ON DELETE CASCADE,
+                    face_id INTEGER NOT NULL REFERENCES library_faces(id) ON DELETE CASCADE,
+                    UNIQUE(cluster_id, face_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_fc_members_cluster ON face_cluster_members(cluster_id);
+                CREATE INDEX IF NOT EXISTS idx_fc_members_face ON face_cluster_members(face_id);
+
+                UPDATE schema_version SET version = 10;
             """)
 
     @contextmanager
@@ -1394,6 +1489,294 @@ class RecommendationsDB:
                     scene_ids
                 )
             return cursor.rowcount
+
+    # ==================== Library Faces ====================
+
+    def add_library_face(
+        self,
+        stash_scene_id: int,
+        frame_index: int,
+        timestamp_sec: Optional[float],
+        bbox: dict,
+        det_confidence: float,
+        yaw: Optional[float],
+        facenet_emb: bytes,
+        arcface_emb: bytes,
+        crop_path: Optional[str] = None,
+        best_match_id: Optional[str] = None,
+        best_match_name: Optional[str] = None,
+        best_match_confidence: Optional[float] = None,
+        db_version: Optional[str] = None,
+    ) -> Optional[int]:
+        """Insert a per-face record. Returns face ID, or None if duplicate."""
+        with self._connection() as conn:
+            try:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO library_faces (
+                        stash_scene_id, frame_index, timestamp_sec,
+                        bbox_x, bbox_y, bbox_w, bbox_h, det_confidence, yaw,
+                        facenet_emb, arcface_emb, crop_path,
+                        best_match_id, best_match_name, best_match_confidence, db_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        stash_scene_id, frame_index, timestamp_sec,
+                        bbox.get("x", 0), bbox.get("y", 0), bbox.get("w", 0), bbox.get("h", 0),
+                        det_confidence, yaw, facenet_emb, arcface_emb, crop_path,
+                        best_match_id, best_match_name, best_match_confidence, db_version,
+                    )
+                )
+                return cursor.lastrowid
+            except sqlite3.IntegrityError:
+                return None
+
+    def delete_library_faces_for_scene(self, stash_scene_id: int) -> int:
+        """Delete all per-face records for a scene (used when re-identifying)."""
+        with self._connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM library_faces WHERE stash_scene_id = ?",
+                (stash_scene_id,)
+            )
+            return cursor.rowcount
+
+    def get_library_face_count(self) -> int:
+        with self._connection() as conn:
+            return conn.execute("SELECT COUNT(*) FROM library_faces").fetchone()[0]
+
+    def iter_library_faces(self, batch_size: int = 500) -> Iterator[list[dict]]:
+        """Iterate all library faces in batches (for index building / clustering)."""
+        with self._connection() as conn:
+            cursor = conn.execute(
+                "SELECT id, facenet_emb, arcface_emb, best_match_id, stash_scene_id FROM library_faces ORDER BY id"
+            )
+            while True:
+                rows = cursor.fetchmany(batch_size)
+                if not rows:
+                    break
+                yield [dict(r) for r in rows]
+
+    def get_library_face(self, face_id: int) -> Optional[dict]:
+        with self._connection() as conn:
+            row = conn.execute("SELECT * FROM library_faces WHERE id = ?", (face_id,)).fetchone()
+            return dict(row) if row else None
+
+    def get_representative_faces(self, cluster_id: int, limit: int = 12) -> list[dict]:
+        """Get sample faces (with crops) for a cluster, best-confidence first."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT lf.id, lf.stash_scene_id, lf.crop_path, lf.det_confidence,
+                       lf.best_match_id, lf.best_match_name, lf.best_match_confidence,
+                       lf.frame_index, lf.timestamp_sec
+                FROM face_cluster_members m
+                JOIN library_faces lf ON lf.id = m.face_id
+                WHERE m.cluster_id = ?
+                ORDER BY lf.det_confidence DESC
+                LIMIT ?
+                """,
+                (cluster_id, limit)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_cluster_scene_ids(self, cluster_id: int) -> list[int]:
+        """Distinct scene IDs containing faces of a cluster."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT lf.stash_scene_id
+                FROM face_cluster_members m
+                JOIN library_faces lf ON lf.id = m.face_id
+                WHERE m.cluster_id = ?
+                ORDER BY lf.stash_scene_id
+                """,
+                (cluster_id,)
+            ).fetchall()
+            return [r[0] for r in rows]
+
+    def get_cluster_face_count(self, cluster_id: int) -> int:
+        with self._connection() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM face_cluster_members WHERE cluster_id = ?",
+                (cluster_id,)
+            ).fetchone()[0]
+
+    def get_cluster_top_matches(self, cluster_id: int, limit: int = 5) -> list[dict]:
+        """Top best-match performers (from identify time) across a cluster's faces."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT best_match_id, best_match_name,
+                       COUNT(*) AS n,
+                       AVG(best_match_confidence) AS avg_conf
+                FROM face_cluster_members m
+                JOIN library_faces lf ON lf.id = m.face_id
+                WHERE m.cluster_id = ? AND best_match_id IS NOT NULL
+                GROUP BY best_match_id
+                ORDER BY n DESC
+                LIMIT ?
+                """,
+                (cluster_id, limit)
+            ).fetchall()
+            return [
+                {"performer_id": r[0], "name": r[1], "face_count": r[2], "avg_confidence": r[3]}
+                for r in rows
+            ]
+
+    # ==================== Face Clusters ====================
+
+    def create_face_cluster(
+        self,
+        name: Optional[str] = None,
+        status: str = "open",
+        performer_id: Optional[str] = None,
+        performer_name: Optional[str] = None,
+    ) -> int:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO face_clusters (name, status, performer_id, performer_name)
+                VALUES (?, ?, ?, ?)
+                """,
+                (name, status, performer_id, performer_name)
+            )
+            return cursor.lastrowid
+
+    def update_face_cluster(
+        self,
+        cluster_id: int,
+        name: Optional[str] = None,
+        status: Optional[str] = None,
+        performer_id: Optional[str] = None,
+        performer_name: Optional[str] = None,
+    ) -> bool:
+        """Partial update. Only non-None fields change."""
+        with self._connection() as conn:
+            sets, params = [], []
+            if name is not None:
+                sets.append("name = ?"); params.append(name)
+            if status is not None:
+                sets.append("status = ?"); params.append(status)
+            if performer_id is not None:
+                sets.append("performer_id = ?"); params.append(performer_id)
+            if performer_name is not None:
+                sets.append("performer_name = ?"); params.append(performer_name)
+            if not sets:
+                return False
+            sets.append("updated_at = datetime('now')")
+            params.append(cluster_id)
+            cursor = conn.execute(
+                f"UPDATE face_clusters SET {', '.join(sets)} WHERE id = ?",
+                params
+            )
+            return cursor.rowcount > 0
+
+    def delete_face_cluster(self, cluster_id: int) -> bool:
+        with self._connection() as conn:
+            cursor = conn.execute("DELETE FROM face_clusters WHERE id = ?", (cluster_id,))
+            return cursor.rowcount > 0
+
+    def get_face_cluster(self, cluster_id: int) -> Optional[dict]:
+        with self._connection() as conn:
+            row = conn.execute("SELECT * FROM face_clusters WHERE id = ?", (cluster_id,)).fetchone()
+            return dict(row) if row else None
+
+    def list_face_clusters(self, status: Optional[str] = None) -> list[dict]:
+        """List clusters with face counts, largest first."""
+        with self._connection() as conn:
+            if status:
+                rows = conn.execute(
+                    """
+                    SELECT c.*, COUNT(m.face_id) AS face_count,
+                           (SELECT COUNT(DISTINCT lf.stash_scene_id)
+                            FROM face_cluster_members mm
+                            JOIN library_faces lf ON lf.id = mm.face_id
+                            WHERE mm.cluster_id = c.id) AS scene_count
+                    FROM face_clusters c
+                    LEFT JOIN face_cluster_members m ON m.cluster_id = c.id
+                    WHERE c.status = ?
+                    GROUP BY c.id
+                    ORDER BY face_count DESC
+                    """,
+                    (status,)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT c.*, COUNT(m.face_id) AS face_count,
+                           (SELECT COUNT(DISTINCT lf.stash_scene_id)
+                            FROM face_cluster_members mm
+                            JOIN library_faces lf ON lf.id = mm.face_id
+                            WHERE mm.cluster_id = c.id) AS scene_count
+                    FROM face_clusters c
+                    LEFT JOIN face_cluster_members m ON m.cluster_id = c.id
+                    GROUP BY c.id
+                    ORDER BY face_count DESC
+                    """
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def add_faces_to_cluster(self, cluster_id: int, face_ids: list[int]) -> int:
+        """Add faces to a cluster (idempotent). Returns newly added count."""
+        added = 0
+        with self._connection() as conn:
+            for fid in face_ids:
+                try:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO face_cluster_members (cluster_id, face_id) VALUES (?, ?)",
+                        (cluster_id, fid)
+                    )
+                    added += 1
+                except sqlite3.IntegrityError:
+                    pass
+        return added
+
+    def remove_faces_from_cluster(self, cluster_id: int, face_ids: list[int]) -> int:
+        with self._connection() as conn:
+            placeholders = ",".join("?" * len(face_ids))
+            cursor = conn.execute(
+                f"DELETE FROM face_cluster_members WHERE cluster_id = ? AND face_id IN ({placeholders})",
+                [cluster_id, *face_ids]
+            )
+            return cursor.rowcount
+
+    def get_unassigned_face_ids(self, limit: Optional[int] = None) -> list[int]:
+        """Face IDs not yet in any non-ignored cluster."""
+        with self._connection() as conn:
+            query = """
+                SELECT lf.id FROM library_faces lf
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM face_cluster_members m
+                    JOIN face_clusters c ON c.id = m.cluster_id
+                    WHERE m.face_id = lf.id AND c.status != 'ignored'
+                )
+                ORDER BY lf.id
+            """
+            if limit:
+                query += f" LIMIT {int(limit)}"
+            return [r[0] for r in conn.execute(query).fetchall()]
+
+    def get_face_cluster_membership(self, face_id: int) -> list[dict]:
+        """Clusters a face belongs to."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT c.* FROM face_cluster_members m
+                JOIN face_clusters c ON c.id = m.cluster_id
+                WHERE m.face_id = ?
+                """,
+                (face_id,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_all_cluster_assignments(self) -> dict[int, list[int]]:
+        """Map of face_id -> [cluster_id] for incremental clustering."""
+        with self._connection() as conn:
+            rows = conn.execute("SELECT cluster_id, face_id FROM face_cluster_members").fetchall()
+            mapping: dict[int, list[int]] = {}
+            for cluster_id, face_id in rows:
+                mapping.setdefault(face_id, []).append(cluster_id)
+            return mapping
 
     # ==================== Image Fingerprints ====================
 

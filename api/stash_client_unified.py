@@ -470,6 +470,33 @@ class StashClientUnified:
         """
         await self._execute(query, {"id": scene_id, "performer_ids": performer_ids}, priority=Priority.CRITICAL)
 
+    def get_scene_performer_ids_sync(self, scene_id: str) -> Optional[dict]:
+        """Read a scene's current performer IDs (synchronous)."""
+        query = """
+        query GetScenePerformers($id: ID!) {
+          findScene(id: $id) {
+            id
+            performers { id }
+          }
+        }
+        """
+        data = self._execute_sync(query, {"id": scene_id})
+        scene = data.get("findScene")
+        if scene is None:
+            return None
+        return {"id": scene["id"], "performer_ids": [p["id"] for p in scene.get("performers") or []]}
+
+    def update_scene_performers_sync(self, scene_id: str, performer_ids: list[str]) -> None:
+        """Update the performers for a scene (synchronous)."""
+        query = """
+        mutation UpdateScene($id: ID!, $performer_ids: [ID!]) {
+          sceneUpdate(input: { id: $id, performer_ids: $performer_ids }) {
+            id
+          }
+        }
+        """
+        self._execute_sync(query, {"id": scene_id, "performer_ids": performer_ids})
+
     async def update_image_performers(self, image_id: str, performer_ids: list[str]) -> None:
         """Update the performers for an image."""
         query = """
@@ -627,6 +654,7 @@ class StashClientUnified:
               name
               disambiguation
               alias_list
+              image_path
               stash_ids {
                 endpoint
                 stash_id

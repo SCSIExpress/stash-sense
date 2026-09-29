@@ -9,6 +9,7 @@ ui:
     - stash-sense-recommendations.js
     - stash-sense-settings.js
     - stash-sense-operations.js
+    - stash-sense-face-groups.js
     - stash-sense.js
   css:
     - stash-sense.css

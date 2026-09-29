@@ -84,6 +84,10 @@ def main():
         result = handle_recommendations(mode, args, sidecar_url)
         if result is None:
             result = {"error": f"Unknown recommendations mode: {mode}"}
+    elif mode.startswith("fg_"):
+        result = handle_face_groups(mode, args, sidecar_url)
+        if result is None:
+            result = {"error": f"Unknown face-groups mode: {mode}"}
     else:
         result = {"error": f"Unknown mode: {mode}"}
 
@@ -331,7 +335,78 @@ def sidecar_delete(sidecar_url, endpoint, timeout=30):
         return {"error": f"Request failed: {e}"}
 
 
+def sidecar_patch(sidecar_url, endpoint, data=None, timeout=30):
+    """PATCH request to sidecar."""
+    try:
+        response = requests.patch(f"{sidecar_url}{endpoint}", json=data, timeout=timeout)
+        if response.ok:
+            return response.json()
+        try:
+            error_detail = response.json().get("detail", response.text)
+        except Exception:
+            error_detail = response.text or f"HTTP {response.status_code}"
+        return {"error": error_detail}
+    except requests.ConnectionError:
+        return {"error": "Connection refused - is Stash Sense running?"}
+    except requests.Timeout:
+        return {"error": "Request timed out"}
+    except requests.RequestException as e:
+        return {"error": f"Request failed: {e}"}
+
+
 # ==================== Queue API Proxy ====================
+
+def handle_face_groups(mode, args, sidecar_url):
+    """Handle face-group (cluster) proxy operations."""
+    if mode == "fg_list":
+        qs = ""
+        if args.get("status"):
+            qs += f"?status={args['status']}"
+        return sidecar_get(sidecar_url, f"/face-groups{qs}")
+    elif mode == "fg_get":
+        return sidecar_get(sidecar_url, f"/face-groups/{args['cluster_id']}")
+    elif mode == "fg_build":
+        return sidecar_post(sidecar_url, "/face-groups/build", {
+            "distance_threshold": args.get("distance_threshold", 0.55),
+            "min_cluster_size": args.get("min_cluster_size", 3),
+            "seed_by_match": args.get("seed_by_match", True),
+            "replace_existing": args.get("replace_existing", True),
+        }, timeout=600)
+    elif mode == "fg_stats":
+        return sidecar_get(sidecar_url, "/face-groups/stats")
+    elif mode == "fg_assign":
+        return sidecar_post(sidecar_url, f"/face-groups/{args['cluster_id']}/assign", {
+            "performer_id": args["performer_id"],
+            "performer_name": args["performer_name"],
+        }, timeout=600)
+    elif mode == "fg_ignore":
+        return sidecar_post(sidecar_url, f"/face-groups/{args['cluster_id']}/ignore")
+    elif mode == "fg_delete":
+        return sidecar_delete(sidecar_url, f"/face-groups/{args['cluster_id']}")
+    elif mode == "fg_merge":
+        return sidecar_post(sidecar_url, "/face-groups/merge", {
+            "source_ids": args["source_ids"],
+            "target_id": args["target_id"],
+        })
+    elif mode == "fg_update":
+        payload = {}
+        if args.get("name") is not None:
+            payload["name"] = args["name"]
+        if args.get("status") is not None:
+            payload["status"] = args["status"]
+        return sidecar_patch(sidecar_url, f"/face-groups/{args['cluster_id']}", payload)
+    elif mode == "fg_crop":
+        # Returns raw JPEG bytes; encode as data URL for <img> use
+        import base64
+        resp = requests.get(
+            f"{sidecar_url}/face-groups/{args['cluster_id']}/face/{args['face_id']}/crop",
+            timeout=30,
+        )
+        if resp.ok:
+            return {"data_url": "data:image/jpeg;base64," + base64.b64encode(resp.content).decode()}
+        return {"error": f"Crop fetch failed: HTTP {resp.status_code}"}
+    return None
+
 
 def handle_queue(mode, args, sidecar_url):
     """Handle queue-related proxy operations."""

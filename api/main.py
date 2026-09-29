@@ -417,6 +417,13 @@ app.include_router(settings_router)
 app.include_router(queue_router)
 app.include_router(model_router)
 
+# Face-group clustering (Immich-style grouping; optional module)
+try:
+    from face_clusters_router import router as face_clusters_router
+    app.include_router(face_clusters_router)
+except ImportError:
+    logging.getLogger(__name__).warning("face_clusters_router unavailable; face groups disabled")
+
 
 if __name__ == "__main__":
     import uvicorn

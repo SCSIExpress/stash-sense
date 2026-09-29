@@ -291,6 +291,9 @@ class QueueManager:
             return FingerprintGenerationJob()
         if type_id == "database_update":
             return DatabaseUpdateJob()
+        if type_id == "cluster_library_faces":
+            from jobs.cluster_faces_job import ClusterLibraryFacesJob
+            return ClusterLibraryFacesJob()
         return AnalysisJob(type_id)
 
     def _check_schedules(self):

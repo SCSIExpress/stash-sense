@@ -1111,6 +1111,25 @@ async def identify_scene(request: SceneIdentifyRequest, _=Depends(require_db_ava
                 fingerprint_error = fp_error
                 print(f"[identify_scene] [{time.time()-t_start:.1f}s] Failed to save fingerprint: {fp_error}")
 
+    # Persist per-face records (embeddings + crops) for library face grouping
+    try:
+        from library_face_persist import persist_from_identify
+        _saved_faces = persist_from_identify(
+            scene_id=int(request.scene_id),
+            extraction_frames=extraction_result.frames,
+            detected_faces=detected_faces,
+            embeddings=embeddings,
+            all_results=all_results,
+            persons=persons,
+            recognizer=_recognizer,
+            cluster_threshold=request.cluster_threshold,
+            db_version=_db_manifest.get("version"),
+        )
+        if _saved_faces:
+            print(f"[identify_scene] [{time.time()-t_start:.1f}s] Persisted {_saved_faces} library faces")
+    except Exception:
+        logging.getLogger(__name__).exception("library face persistence failed (non-fatal)")
+
     timing_data = {
         "total_ms": round((time.time() - t_start) * 1000),
         "extraction_ms": round((t_face_loop - t_extract) * 1000),
