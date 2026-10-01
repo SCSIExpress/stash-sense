@@ -9,13 +9,199 @@ See: docs/plans/2026-01-28-recommendations-engine-design.md
 
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 14
+
+
+
+_FACE_CLUSTER_V12_DDL = """
+    -- A cluster's identity in StashDB/stash-box id space (matched anchor, or the
+    -- assigned performer's stash ids).
+    CREATE TABLE IF NOT EXISTS face_cluster_stash_ids (
+        cluster_id INTEGER NOT NULL REFERENCES face_clusters(id) ON DELETE CASCADE,
+        stash_id TEXT NOT NULL,
+        PRIMARY KEY (cluster_id, stash_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_fc_stash_ids_stash ON face_cluster_stash_ids(stash_id);
+
+    -- Durable rejection memory (eject/split). No FK on ref: cluster refs are
+    -- resolved through the merge log at read time.
+    CREATE TABLE IF NOT EXISTS face_rejections (
+        face_id INTEGER NOT NULL REFERENCES library_faces(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('cluster','performer','stash_id')),
+        ref TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (face_id, kind, ref)
+    );
+"""
+
+
+# v14: StashDB ids a user decision took away from a group (re-assigning it to
+# another performer, or the performer's own StashDB link contradicting the
+# group's match anchor). Member-derived anchors never re-add them.
+_FACE_CLUSTER_V14_DDL = """
+    CREATE TABLE IF NOT EXISTS face_cluster_blocked_stash_ids (
+        cluster_id INTEGER NOT NULL REFERENCES face_clusters(id) ON DELETE CASCADE,
+        stash_id TEXT NOT NULL,
+        PRIMARY KEY (cluster_id, stash_id)
+    );
+"""
+
+
+_LIBRARY_FACES_COLUMNS = (
+    "id, stash_scene_id, frame_index, timestamp_sec, bbox_x, bbox_y, bbox_w, bbox_h, "
+    "det_confidence, yaw, facenet_emb, arcface_emb, crop_path, best_match_id, "
+    "best_match_name, best_match_confidence, db_version, created_at"
+)
+
+
+def _library_faces_ddl(table: str = "library_faces") -> str:
+    """library_faces as of v13: no inline UNIQUE (see _LIBRARY_FACES_KEY_DDL)."""
+    return f"""
+    CREATE TABLE IF NOT EXISTS {table} (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        stash_scene_id INTEGER NOT NULL,
+        frame_index INTEGER NOT NULL,
+        timestamp_sec REAL,
+        bbox_x REAL NOT NULL,
+        bbox_y REAL NOT NULL,
+        bbox_w REAL NOT NULL,
+        bbox_h REAL NOT NULL,
+        det_confidence REAL NOT NULL,
+        yaw REAL,
+        facenet_emb BLOB NOT NULL,
+        arcface_emb BLOB NOT NULL,
+        crop_path TEXT,
+        best_match_id TEXT,
+        best_match_name TEXT,
+        best_match_confidence REAL,
+        db_version TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+"""
+
+
+# One row per detection: the key includes the timestamp, so after a sampling
+# change (other num_frames / offsets / duration) a new face at the same frame
+# index and box position as a kept (curated) row from the old sampling is a
+# different row, not a silently dropped duplicate.
+_LIBRARY_FACES_KEY_DDL = """
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_lib_faces_key ON library_faces(
+        stash_scene_id, frame_index, IFNULL(timestamp_sec, -1.0), bbox_x, bbox_y, bbox_w, bbox_h);
+    CREATE INDEX IF NOT EXISTS idx_lib_faces_scene ON library_faces(stash_scene_id);
+    CREATE INDEX IF NOT EXISTS idx_lib_faces_match ON library_faces(best_match_id);
+"""
+
+
+def _rebuild_library_faces_v13(conn: sqlite3.Connection) -> None:
+    """Rebuild library_faces without the inline UNIQUE(scene, frame, x, y).
+
+    Standard SQLite table rebuild with foreign keys OFF, so the members and
+    rejections that reference library_faces(id) are not cascaded away. Ids and
+    the AUTOINCREMENT sequence are preserved. Commits.
+    """
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        row = conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'library_faces'"
+        ).fetchone()
+        seq = row[0] if row else 0
+        conn.execute("DROP TABLE IF EXISTS library_faces_v13")
+        conn.executescript("BEGIN;" + _library_faces_ddl("library_faces_v13") + f"""
+            INSERT INTO library_faces_v13 ({_LIBRARY_FACES_COLUMNS})
+                SELECT {_LIBRARY_FACES_COLUMNS} FROM library_faces;
+            DROP TABLE library_faces;
+            ALTER TABLE library_faces_v13 RENAME TO library_faces;
+        """ + _LIBRARY_FACES_KEY_DDL)
+        conn.execute(
+            "UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'library_faces'", (seq,)
+        )
+        bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if bad:
+            raise sqlite3.IntegrityError(f"foreign key violations after library_faces rebuild: {bad[:5]}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _dedupe_matched_clusters_v12(conn: sqlite3.Connection) -> None:
+    """Collapse duplicate matched clusters per stash_id (left by old full builds).
+
+    Keeps the cluster with the most members (ties: lowest id), copies the others'
+    members and stash ids into it, then deletes them.
+    """
+    dup_sids = [r[0] for r in conn.execute(
+        """
+        SELECT s.stash_id FROM face_cluster_stash_ids s
+        JOIN face_clusters c ON c.id = s.cluster_id
+        WHERE c.status = 'matched'
+        GROUP BY s.stash_id HAVING COUNT(*) > 1
+        """
+    ).fetchall()]
+    for sid in dup_sids:
+        rows = conn.execute(
+            """
+            SELECT c.id, c.pinned,
+                   (SELECT COUNT(*) FROM face_cluster_members m WHERE m.cluster_id = c.id) AS n
+            FROM face_clusters c
+            JOIN face_cluster_stash_ids s ON s.cluster_id = c.id
+            WHERE c.status = 'matched' AND s.stash_id = ?
+            ORDER BY n DESC, c.id ASC
+            """,
+            (sid,),
+        ).fetchall()
+        if len(rows) < 2:
+            continue  # already folded by an earlier stash_id in this loop
+        keep = rows[0][0]
+        for other, pinned, _n in rows[1:]:
+            conn.execute(
+                "INSERT OR IGNORE INTO face_cluster_members (cluster_id, face_id) "
+                "SELECT ?, face_id FROM face_cluster_members WHERE cluster_id = ?",
+                (keep, other),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO face_cluster_stash_ids (cluster_id, stash_id) "
+                "SELECT ?, stash_id FROM face_cluster_stash_ids WHERE cluster_id = ?",
+                (keep, other),
+            )
+            if pinned:
+                conn.execute("UPDATE face_clusters SET pinned = 1 WHERE id = ?", (keep,))
+            conn.execute("DELETE FROM face_clusters WHERE id = ?", (other,))
+
+
+def _unit_face_vec(facenet: bytes | None, arcface: bytes | None):
+    """Normalized facenet+arcface concat vector of a stored face (None if unusable)."""
+    import numpy as np
+    if not facenet or not arcface:
+        return None
+    v = np.concatenate([np.frombuffer(facenet, dtype=np.float32),
+                        np.frombuffer(arcface, dtype=np.float32)])
+    n = float(np.linalg.norm(v))
+    return v / n if n > 0 else None
+
+
+def _bbox_iou(a: dict, b: dict) -> float:
+    """IoU of two {x, y, w, h} boxes. 0 when either box has zero area."""
+    ax, ay, aw, ah = (float(a.get(k, 0) or 0) for k in ("x", "y", "w", "h"))
+    bx, by, bw, bh = (float(b.get(k, 0) or 0) for k in ("x", "y", "w", "h"))
+    if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
+        return 0.0
+    iw = min(ax + aw, bx + bw) - max(ax, bx)
+    ih = min(ay + ah, by + bh) - max(ay, by)
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    inter = iw * ih
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
 
 
 @dataclass
@@ -310,32 +496,11 @@ class RecommendationsDB:
                 next_run_at TEXT
             );
 
-            -- Per-face persistence for Immich-style face grouping.
-            CREATE TABLE IF NOT EXISTS library_faces (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                stash_scene_id INTEGER NOT NULL,
-                frame_index INTEGER NOT NULL,
-                timestamp_sec REAL,
-                bbox_x REAL NOT NULL,
-                bbox_y REAL NOT NULL,
-                bbox_w REAL NOT NULL,
-                bbox_h REAL NOT NULL,
-                det_confidence REAL NOT NULL,
-                yaw REAL,
-                facenet_emb BLOB NOT NULL,
-                arcface_emb BLOB NOT NULL,
-                crop_path TEXT,
-                best_match_id TEXT,
-                best_match_name TEXT,
-                best_match_confidence REAL,
-                db_version TEXT,
-                created_at TEXT DEFAULT (datetime('now')),
-                UNIQUE(stash_scene_id, frame_index, bbox_x, bbox_y)
-            );
-            CREATE INDEX IF NOT EXISTS idx_lib_faces_scene ON library_faces(stash_scene_id);
-            CREATE INDEX IF NOT EXISTS idx_lib_faces_match ON library_faces(best_match_id);
-
+            -- Per-face persistence for Immich-style face grouping (see _library_faces_ddl).
             -- User-curated face groups.
+            -- performer_id is always a LOCAL Stash performer id (or NULL); a group's
+            -- StashDB/stash-box identity lives in face_cluster_stash_ids.
+            -- pinned = 1: user-curated, never dissolved by a full rebuild.
             CREATE TABLE IF NOT EXISTS face_clusters (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT,
@@ -343,7 +508,10 @@ class RecommendationsDB:
                 performer_id TEXT,
                 performer_name TEXT,
                 created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT DEFAULT (datetime('now'))
+                updated_at TEXT DEFAULT (datetime('now')),
+                pinned INTEGER NOT NULL DEFAULT 0,
+                -- 1 once an assigned group's performer stash ids were fetched from Stash
+                stash_ids_synced INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS face_cluster_members (
@@ -360,7 +528,8 @@ class RecommendationsDB:
                 target_cluster_id INTEGER NOT NULL,
                 merged_at TEXT DEFAULT (datetime('now'))
             );
-        """)
+        """ + _library_faces_ddl() + _LIBRARY_FACES_KEY_DDL + _FACE_CLUSTER_V12_DDL
+            + _FACE_CLUSTER_V14_DDL)
 
     def _migrate_schema(self, conn: sqlite3.Connection, from_version: int):
         """Migrate schema from older version."""
@@ -597,10 +766,92 @@ class RecommendationsDB:
                 UPDATE schema_version SET version = 11;
             """)
 
+        if from_version < 12:
+            # Idempotent DDL (a failed earlier attempt may have added the column already).
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(face_clusters)")}
+            if "pinned" not in cols:
+                conn.execute(
+                    "ALTER TABLE face_clusters ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
+                )
+            conn.executescript(_FACE_CLUSTER_V12_DDL)
+            # Data fix-ups, the matched-cluster dedupe and the version bump share one
+            # transaction: executescript leaves the BEGIN open, the connection
+            # context manager commits (or rolls back) all of it together.
+            conn.executescript("""
+                BEGIN;
+                -- matched groups: move the StashDB anchor out of performer_id
+                INSERT OR IGNORE INTO face_cluster_stash_ids (cluster_id, stash_id)
+                    SELECT id, performer_id FROM face_clusters
+                    WHERE status = 'matched' AND performer_id IS NOT NULL;
+                UPDATE face_clusters SET performer_id = NULL WHERE status = 'matched';
+                UPDATE face_clusters SET pinned = 1
+                    WHERE status IN ('assigned', 'ignored', 'banned')
+                       OR id IN (SELECT target_cluster_id FROM face_cluster_merge_log)
+                       OR (status = 'open' AND name IS NOT NULL);
+                -- a face in a curated group loses any extra open/matched membership
+                DELETE FROM face_cluster_members WHERE rowid IN (
+                    SELECT m.rowid FROM face_cluster_members m
+                    JOIN face_clusters c ON c.id = m.cluster_id
+                    WHERE c.status IN ('open', 'matched') AND EXISTS (
+                        SELECT 1 FROM face_cluster_members m2
+                        JOIN face_clusters c2 ON c2.id = m2.cluster_id
+                        WHERE m2.face_id = m.face_id AND c2.id != c.id
+                          AND c2.status IN ('assigned', 'ignored', 'banned')));
+                -- ghost empty banned groups left by the old re-identify cascade
+                DELETE FROM face_clusters
+                    WHERE status = 'banned'
+                      AND id NOT IN (SELECT cluster_id FROM face_cluster_members);
+            """)
+            _dedupe_matched_clusters_v12(conn)
+            conn.execute("UPDATE schema_version SET version = 12")
+
+        if from_version < 13:
+            # 1. UNIQUE key gains the timestamp (table rebuild, FKs off, own commit).
+            _rebuild_library_faces_v13(conn)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(face_clusters)")}
+            if "stash_ids_synced" not in cols:
+                conn.execute(
+                    "ALTER TABLE face_clusters ADD COLUMN stash_ids_synced INTEGER NOT NULL DEFAULT 0"
+                )
+            # 2. Anchors written before v13 are untrustworthy: the persist step
+            #    mapped faces to persons by position (wrong in multi-person
+            #    scenes), fell back to persons[-1], and hybrid mode handed faces
+            #    to a performer through secondary matches. Clear them (the next
+            #    identify of each scene rewrites them) and dissolve the
+            #    automatic matched groups seeded from them; their faces return
+            #    to the pool and are re-placed by embedding. Pinned (curated)
+            #    groups are kept. The fingerprint job skips scenes whose
+            #    fingerprint is current, so mark those scenes outdated.
+            conn.executescript("""
+                BEGIN;
+                UPDATE library_faces
+                    SET best_match_id = NULL, best_match_name = NULL, best_match_confidence = NULL;
+                UPDATE scene_fingerprints SET db_version = NULL, updated_at = datetime('now')
+                    WHERE stash_scene_id IN (SELECT DISTINCT stash_scene_id FROM library_faces);
+                DELETE FROM face_clusters WHERE status = 'matched' AND pinned = 0;
+                UPDATE schema_version SET version = 13;
+            """)
+
+        if from_version < 14:
+            # Blocked-anchor memory, and the face key gains the box size (two
+            # detections sharing a top-left corner at one moment are distinct
+            # faces). Widening a UNIQUE key never fails on existing rows.
+            conn.executescript("BEGIN;" + _FACE_CLUSTER_V14_DDL + """
+                DROP INDEX IF EXISTS uq_lib_faces_key;
+            """ + _LIBRARY_FACES_KEY_DDL + """
+                -- "synced" now means "the performer is linked on StashDB";
+                -- v13 also set it after lookups that found no such link.
+                -- Re-check every assigned group once.
+                UPDATE face_clusters SET stash_ids_synced = 0;
+                UPDATE schema_version SET version = 14;
+            """)
+
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
         """Get a database connection with row factory."""
-        conn = sqlite3.connect(self.db_path)
+        # Generous busy timeout: a build reading the face pool and a scene
+        # persist committing can overlap for a while on large libraries.
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         try:
@@ -1527,7 +1778,13 @@ class RecommendationsDB:
         best_match_confidence: float | None = None,
         db_version: str | None = None,
     ) -> int | None:
-        """Insert a per-face record. Returns face ID, or None if duplicate."""
+        """Insert one raw per-face record. Returns face ID, or None if duplicate.
+
+        Low-level insert for tests and tooling only: it applies none of the
+        anchoring rules (best_match_id is stored as given) and none of the
+        re-identify pairing. Identification writes go through
+        library_face_persist.persist_from_identify -> upsert_scene_library_faces.
+        """
         with self._connection() as conn:
             try:
                 cursor = conn.execute(
@@ -1562,18 +1819,6 @@ class RecommendationsDB:
     def get_library_face_count(self) -> int:
         with self._connection() as conn:
             return conn.execute("SELECT COUNT(*) FROM library_faces").fetchone()[0]
-
-    def iter_library_faces(self, batch_size: int = 500) -> Iterator[list[dict]]:
-        """Iterate all library faces in batches (for index building / clustering)."""
-        with self._connection() as conn:
-            cursor = conn.execute(
-                "SELECT id, facenet_emb, arcface_emb, best_match_id, stash_scene_id FROM library_faces ORDER BY id"
-            )
-            while True:
-                rows = cursor.fetchmany(batch_size)
-                if not rows:
-                    break
-                yield [dict(r) for r in rows]
 
     def get_library_face(self, face_id: int) -> dict | None:
         with self._connection() as conn:
@@ -1650,16 +1895,29 @@ class RecommendationsDB:
         status: str = "open",
         performer_id: str | None = None,
         performer_name: str | None = None,
+        pinned: bool = False,
+        stash_ids: list[str] | None = None,
     ) -> int:
+        """Create a cluster (and its stash ids) in one transaction.
+
+        performer_id must be a LOCAL Stash performer id or None; StashDB identity
+        goes in stash_ids.
+        """
         with self._connection() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO face_clusters (name, status, performer_id, performer_name)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO face_clusters (name, status, performer_id, performer_name, pinned)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (name, status, performer_id, performer_name)
+                (name, status, performer_id, performer_name, 1 if pinned else 0)
             )
-            return cursor.lastrowid
+            cluster_id = cursor.lastrowid
+            if stash_ids:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO face_cluster_stash_ids (cluster_id, stash_id) VALUES (?, ?)",
+                    [(cluster_id, sid) for sid in stash_ids]
+                )
+            return cluster_id
 
     def update_face_cluster(
         self,
@@ -1668,18 +1926,26 @@ class RecommendationsDB:
         status: str | None = None,
         performer_id: str | None = None,
         performer_name: str | None = None,
+        pinned: bool | None = None,
     ) -> bool:
         """Partial update. Only non-None fields change."""
         with self._connection() as conn:
             sets, params = [], []
+            if pinned is not None:
+                sets.append("pinned = ?")
+                params.append(1 if pinned else 0)
             if name is not None:
-                sets.append("name = ?"); params.append(name)
+                sets.append("name = ?")
+                params.append(name)
             if status is not None:
-                sets.append("status = ?"); params.append(status)
+                sets.append("status = ?")
+                params.append(status)
             if performer_id is not None:
-                sets.append("performer_id = ?"); params.append(performer_id)
+                sets.append("performer_id = ?")
+                params.append(performer_id)
             if performer_name is not None:
-                sets.append("performer_name = ?"); params.append(performer_name)
+                sets.append("performer_name = ?")
+                params.append(performer_name)
             if not sets:
                 return False
             sets.append("updated_at = datetime('now')")
@@ -1690,15 +1956,37 @@ class RecommendationsDB:
             )
             return cursor.rowcount > 0
 
-    def delete_face_cluster(self, cluster_id: int) -> bool:
+    def delete_face_cluster(self, cluster_id: int, only_unpinned: bool = False) -> bool:
+        """Delete a cluster (members cascade back to the pool). only_unpinned:
+        skip it if it is pinned *at delete time* (a curation that raced ahead
+        of a build wins)."""
         with self._connection() as conn:
-            cursor = conn.execute("DELETE FROM face_clusters WHERE id = ?", (cluster_id,))
+            cursor = conn.execute(
+                "DELETE FROM face_clusters WHERE id = ?" + (" AND pinned = 0" if only_unpinned else ""),
+                (cluster_id,))
             return cursor.rowcount > 0
 
+    def delete_cluster_if_empty(self, cluster_id: int) -> bool:
+        """Delete the cluster only if it has no members (checked atomically)."""
+        with self._connection() as conn:
+            return conn.execute(
+                "DELETE FROM face_clusters WHERE id = ? AND NOT EXISTS "
+                "(SELECT 1 FROM face_cluster_members m WHERE m.cluster_id = ?)",
+                (cluster_id, cluster_id),
+            ).rowcount > 0
+
     def get_face_cluster(self, cluster_id: int) -> dict | None:
+        """Cluster row (incl. pinned) plus "stash_ids" (sorted list)."""
         with self._connection() as conn:
             row = conn.execute("SELECT * FROM face_clusters WHERE id = ?", (cluster_id,)).fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            cluster = dict(row)
+            cluster["stash_ids"] = [r[0] for r in conn.execute(
+                "SELECT stash_id FROM face_cluster_stash_ids WHERE cluster_id = ? ORDER BY stash_id",
+                (cluster_id,)
+            ).fetchall()]
+            return cluster
 
     def list_face_clusters(self, status: str | None = None) -> list[dict]:
         """List clusters with face counts, largest first."""
@@ -1736,18 +2024,23 @@ class RecommendationsDB:
             return [dict(r) for r in rows]
 
     def add_faces_to_cluster(self, cluster_id: int, face_ids: list[int]) -> int:
-        """Add faces to a cluster (idempotent). Returns newly added count."""
+        """Add faces to a cluster in one transaction. Returns rows actually inserted.
+
+        Raises ValueError if the cluster does not exist. An unknown face_id raises
+        sqlite3.IntegrityError (FK) and rolls back the whole call.
+        """
+        if not face_ids:
+            return 0
         added = 0
         with self._connection() as conn:
+            if conn.execute("SELECT 1 FROM face_clusters WHERE id = ?", (cluster_id,)).fetchone() is None:
+                raise ValueError(f"cluster {cluster_id} not found")
             for fid in face_ids:
-                try:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO face_cluster_members (cluster_id, face_id) VALUES (?, ?)",
-                        (cluster_id, fid)
-                    )
-                    added += 1
-                except sqlite3.IntegrityError:
-                    pass
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO face_cluster_members (cluster_id, face_id) VALUES (?, ?)",
+                    (cluster_id, fid)
+                )
+                added += cursor.rowcount
         return added
 
     def remove_faces_from_cluster(self, cluster_id: int, face_ids: list[int]) -> int:
@@ -1760,19 +2053,12 @@ class RecommendationsDB:
             return cursor.rowcount
 
     def get_unassigned_face_ids(self, limit: int | None = None) -> list[int]:
-        """Face IDs not in any live cluster and not banned."""
+        """Face IDs with no membership in any cluster (whatever its status)."""
         with self._connection() as conn:
             query = """
                 SELECT lf.id FROM library_faces lf
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM face_cluster_members m
-                    JOIN face_clusters c ON c.id = m.cluster_id
-                    WHERE m.face_id = lf.id AND c.status != 'ignored'
-                )
-                AND NOT EXISTS (
-                    SELECT 1 FROM face_cluster_members m2
-                    JOIN face_clusters c2 ON c2.id = m2.cluster_id
-                    WHERE m2.face_id = lf.id AND c2.status = 'banned'
+                    SELECT 1 FROM face_cluster_members m WHERE m.face_id = lf.id
                 )
                 ORDER BY lf.id
             """
@@ -1806,6 +2092,8 @@ class RecommendationsDB:
         """Remember that source clusters were merged into target (for rebuilds)."""
         with self._connection() as conn:
             for sid in source_ids:
+                if sid == target_id:
+                    continue
                 conn.execute(
                     "INSERT OR REPLACE INTO face_cluster_merge_log (source_cluster_id, target_cluster_id) VALUES (?, ?)",
                     (sid, target_id)
@@ -1828,31 +2116,24 @@ class RecommendationsDB:
             mapping[src] = dst
         return mapping
 
-    def iter_library_faces(self, unassigned_only: bool = False, batch_size: int = 500) -> Iterator[list[dict]]:
-        """Iterate all library faces (or only unassigned ones) in batches."""
+    def iter_library_faces(
+        self, unassigned_only: bool = False, batch_size: int = 500
+    ) -> Iterator[list[dict]]:
+        """Iterate library faces in batches of dicts.
+
+        Keys: id, facenet_emb, arcface_emb, best_match_id, best_match_name, stash_scene_id.
+        unassigned_only=True yields only faces with NO membership in any cluster,
+        whatever its status (open/matched/assigned/ignored/banned).
+        """
+        cols = ("lf.id, lf.facenet_emb, lf.arcface_emb, lf.best_match_id, "
+                "lf.best_match_name, lf.stash_scene_id")
+        query = f"SELECT {cols} FROM library_faces lf"
+        if unassigned_only:
+            query += (" WHERE NOT EXISTS (SELECT 1 FROM face_cluster_members m"
+                      " WHERE m.face_id = lf.id)")
+        query += " ORDER BY lf.id"
         with self._connection() as conn:
-            if unassigned_only:
-                cursor = conn.execute(
-                    """
-                    SELECT lf.id, lf.facenet_emb, lf.arcface_emb, lf.best_match_id, lf.stash_scene_id
-                    FROM library_faces lf
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM face_cluster_members m
-                        JOIN face_clusters c ON c.id = m.cluster_id
-                        WHERE m.face_id = lf.id AND c.status != 'ignored'
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1 FROM face_cluster_members m2
-                        JOIN face_clusters c2 ON c2.id = m2.cluster_id
-                        WHERE m2.face_id = lf.id AND c2.status = 'banned'
-                    )
-                    ORDER BY lf.id
-                    """
-                )
-            else:
-                cursor = conn.execute(
-                    "SELECT id, facenet_emb, arcface_emb, best_match_id, stash_scene_id FROM library_faces ORDER BY id"
-                )
+            cursor = conn.execute(query)
             while True:
                 rows = cursor.fetchmany(batch_size)
                 if not rows:
@@ -1906,6 +2187,779 @@ class RecommendationsDB:
                 list(statuses)
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ---------- cluster stash ids (StashDB / stash-box id space) ----------
+
+    def get_cluster_stash_ids(self, cluster_id: int) -> list[str]:
+        with self._connection() as conn:
+            return [r[0] for r in conn.execute(
+                "SELECT stash_id FROM face_cluster_stash_ids WHERE cluster_id = ? ORDER BY stash_id",
+                (cluster_id,)
+            ).fetchall()]
+
+    def set_cluster_stash_ids(
+        self, cluster_id: int, stash_ids: list[str], replace: bool = True
+    ) -> int:
+        """Store a cluster's stash ids. replace=True drops existing rows first.
+
+        Returns rows inserted. Raises ValueError if the cluster does not exist.
+        """
+        with self._connection() as conn:
+            if conn.execute("SELECT 1 FROM face_clusters WHERE id = ?", (cluster_id,)).fetchone() is None:
+                raise ValueError(f"cluster {cluster_id} not found")
+            if replace:
+                conn.execute("DELETE FROM face_cluster_stash_ids WHERE cluster_id = ?", (cluster_id,))
+            inserted = 0
+            for sid in stash_ids:
+                inserted += conn.execute(
+                    "INSERT OR IGNORE INTO face_cluster_stash_ids (cluster_id, stash_id) VALUES (?, ?)",
+                    (cluster_id, sid)
+                ).rowcount
+            return inserted
+
+    def get_all_cluster_stash_ids(self) -> dict[int, set[str]]:
+        with self._connection() as conn:
+            mapping: dict[int, set[str]] = {}
+            for cid, sid in conn.execute(
+                "SELECT cluster_id, stash_id FROM face_cluster_stash_ids"
+            ).fetchall():
+                mapping.setdefault(cid, set()).add(sid)
+            return mapping
+
+    def get_stash_id_cluster_map(
+        self, statuses: tuple[str, ...] = ("assigned", "ignored", "matched", "open")
+    ) -> dict[str, int]:
+        """stash_id -> cluster_id among clusters with the given statuses.
+
+        Ties across clusters: assigned > ignored > matched > open (user
+        decisions first: faces of an ignored identity keep landing in the
+        ignored group instead of re-seeding a matched suggestion); among
+        assigned groups one whose performer is linked to the id on StashDB
+        (synced) beats one that only carries it as a member anchor; then more
+        faces, then lower id.
+        """
+        if not statuses:
+            return {}
+        placeholders = ",".join("?" * len(statuses))
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT s.stash_id, c.id,
+                       CASE c.status WHEN 'assigned' THEN 0 WHEN 'ignored' THEN 1
+                                     WHEN 'matched' THEN 2 WHEN 'open' THEN 3 ELSE 4 END AS prio,
+                       CASE WHEN c.status = 'assigned' AND c.stash_ids_synced = 1
+                            THEN 0 ELSE 1 END AS anchor_only,
+                       (SELECT COUNT(*) FROM face_cluster_members m WHERE m.cluster_id = c.id) AS n
+                FROM face_cluster_stash_ids s
+                JOIN face_clusters c ON c.id = s.cluster_id
+                WHERE c.status IN ({placeholders})
+                ORDER BY s.stash_id, prio ASC, anchor_only ASC, n DESC, c.id ASC
+                """,
+                list(statuses)
+            ).fetchall()
+        mapping: dict[str, int] = {}
+        for sid, cid, _prio, _anchor_only, _n in rows:
+            mapping.setdefault(sid, cid)
+        return mapping
+
+    def get_duplicate_stash_id_groups(self) -> list[tuple[int, list[int]]]:
+        """(keeper, [unpinned matched/open duplicates]) per stash id shared by
+        several live/ignored groups. The keeper is the get_stash_id_cluster_map
+        winner; only automatic (unpinned matched/open) groups are listed as
+        duplicates, curated groups are never folded."""
+        winners = self.get_stash_id_cluster_map()
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.stash_id, c.id FROM face_cluster_stash_ids s
+                JOIN face_clusters c ON c.id = s.cluster_id
+                WHERE c.status IN ('matched', 'open') AND c.pinned = 0
+                ORDER BY c.id
+                """
+            ).fetchall()
+        out: dict[int, list[int]] = {}
+        for sid, cid in rows:
+            keeper = winners.get(sid)
+            if keeper is not None and keeper != cid and cid not in out.get(keeper, []):
+                out.setdefault(keeper, []).append(cid)
+        # a group listed as duplicate must not also be a keeper
+        dups = {c for v in out.values() for c in v}
+        return [(k, v) for k, v in out.items() if k not in dups]
+
+    def fold_cluster_into(
+        self, source_id: int, target_id: int, exclude_face_ids: Iterable[int] = ()
+    ) -> int | None:
+        """Fold an automatic group into another (one transaction).
+
+        Moves members (except exclude_face_ids, which return to the pool) and
+        stash ids, logs the merge, deletes the source. Unlike
+        move_faces_to_cluster it does not pin the target. Returns faces moved,
+        or None if either group no longer exists (nothing changed).
+        """
+        excluded = list(dict.fromkeys(int(f) for f in exclude_face_ids))
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            n = conn.execute(
+                "SELECT COUNT(*) FROM face_clusters WHERE id IN (?, ?)", (source_id, target_id)
+            ).fetchone()[0]
+            if source_id == target_id or n != 2:
+                return None
+            # a group a user curated since the duplicate scan is not automatic any more
+            if conn.execute(
+                "SELECT pinned FROM face_clusters WHERE id = ?", (source_id,)
+            ).fetchone()[0]:
+                return None
+            not_in = ""
+            params: list = [target_id, source_id]
+            if excluded:
+                not_in = f" AND face_id NOT IN ({','.join('?' * len(excluded))})"
+                params.extend(excluded)
+            moved = conn.execute(
+                "INSERT OR IGNORE INTO face_cluster_members (cluster_id, face_id) "
+                f"SELECT ?, face_id FROM face_cluster_members WHERE cluster_id = ?{not_in}",
+                params,
+            ).rowcount
+            conn.execute(
+                "INSERT OR IGNORE INTO face_cluster_stash_ids (cluster_id, stash_id) "
+                "SELECT ?, stash_id FROM face_cluster_stash_ids WHERE cluster_id = ? "
+                "AND stash_id NOT IN (SELECT stash_id FROM face_cluster_blocked_stash_ids "
+                "WHERE cluster_id = ?)",
+                (target_id, source_id, target_id),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO face_cluster_merge_log (source_cluster_id, target_cluster_id) "
+                "VALUES (?, ?)",
+                (source_id, target_id),
+            )
+            conn.execute("DELETE FROM face_clusters WHERE id = ?", (source_id,))
+        return moved
+
+    def place_faces(self, cluster_id: int, face_ids: list[int]) -> int | None:
+        """Build-time add: insert only faces that still exist and are still
+        pooled (no membership anywhere: a face split, banned or assigned since
+        the build read the pool is never put into a second group), into a
+        cluster that still exists. Returns rows inserted, or None if the
+        cluster is gone.
+
+        Builds read the pool and the cluster list up front; a concurrent
+        re-identify can delete pooled faces and a user can delete or merge a
+        group before the build writes. Those must not abort the build.
+        """
+        if not face_ids:
+            return 0
+        added = 0
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM face_clusters WHERE id = ?", (cluster_id,)).fetchone() is None:
+                return None
+            for fid in face_ids:
+                added += conn.execute(
+                    "INSERT OR IGNORE INTO face_cluster_members (cluster_id, face_id) "
+                    "SELECT ?, lf.id FROM library_faces lf WHERE lf.id = ? AND NOT EXISTS "
+                    "(SELECT 1 FROM face_cluster_members m WHERE m.face_id = lf.id)",
+                    (cluster_id, fid),
+                ).rowcount
+        return added
+
+    # ---------- stash-id sync bookkeeping ----------
+
+    def get_assigned_clusters_needing_stash_sync(self, include_synced: bool = False) -> list[dict]:
+        """Assigned groups whose performer stash ids were never fetched, or that
+        have no stash ids at all (the performer may have been linked since).
+        include_synced: every assigned group with a performer (links can
+        change in Stash; full builds re-check them all)."""
+        cond = "" if include_synced else (
+            " AND (c.stash_ids_synced = 0 OR NOT EXISTS ("
+            "SELECT 1 FROM face_cluster_stash_ids s WHERE s.cluster_id = c.id))")
+        with self._connection() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT c.* FROM face_clusters c "
+                "WHERE c.status = 'assigned' AND c.performer_id IS NOT NULL AND c.performer_id != ''"
+                f"{cond} ORDER BY c.id"
+            ).fetchall()]
+
+    def set_cluster_stash_ids_synced(self, cluster_id: int, synced: bool = True) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE face_clusters SET stash_ids_synced = ? WHERE id = ?",
+                (1 if synced else 0, cluster_id),
+            )
+
+    def block_cluster_stash_ids(self, cluster_id: int, stash_ids: Iterable[str]) -> int:
+        """Remember stash ids a user decision took away from this cluster.
+        Member-derived anchors never re-add them. Returns rows inserted."""
+        ids = [s for s in stash_ids if s]
+        if not ids:
+            return 0
+        with self._connection() as conn:
+            return sum(conn.execute(
+                "INSERT OR IGNORE INTO face_cluster_blocked_stash_ids (cluster_id, stash_id) "
+                "SELECT ?, ? WHERE EXISTS (SELECT 1 FROM face_clusters WHERE id = ?)",
+                (cluster_id, sid, cluster_id),
+            ).rowcount for sid in ids)
+
+    def unblock_cluster_stash_ids(self, cluster_id: int, stash_ids: Iterable[str]) -> int:
+        ids = [s for s in stash_ids if s]
+        if not ids:
+            return 0
+        with self._connection() as conn:
+            return conn.execute(
+                "DELETE FROM face_cluster_blocked_stash_ids WHERE cluster_id = ? "
+                f"AND stash_id IN ({','.join('?' * len(ids))})",
+                (cluster_id, *ids),
+            ).rowcount
+
+    def get_blocked_stash_ids(self, cluster_id: int) -> set[str]:
+        with self._connection() as conn:
+            return {r[0] for r in conn.execute(
+                "SELECT stash_id FROM face_cluster_blocked_stash_ids WHERE cluster_id = ?",
+                (cluster_id,),
+            ).fetchall()}
+
+    def split_faces_to_new_cluster(
+        self, cluster_id: int, face_ids: list[int], new_status: str = "open",
+    ) -> int:
+        """One transaction: create a pinned cluster, move face_ids (members of
+        cluster_id) into it and pin the source. Raises ValueError if the source
+        is gone or none of the faces are its members. Returns the new id."""
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM face_clusters WHERE id = ?", (cluster_id,)).fetchone() is None:
+                raise ValueError(f"cluster {cluster_id} not found")
+            ids = list(dict.fromkeys(int(f) for f in face_ids))
+            members = [r[0] for r in conn.execute(
+                f"SELECT face_id FROM face_cluster_members WHERE cluster_id = ? "
+                f"AND face_id IN ({','.join('?' * len(ids))})", (cluster_id, *ids),
+            ).fetchall()] if ids else []
+            if not members:
+                raise ValueError(f"none of the faces are in cluster {cluster_id}")
+            new_id = conn.execute(
+                "INSERT INTO face_clusters (status, pinned) VALUES (?, 1)", (new_status,)
+            ).lastrowid
+            ph = ",".join("?" * len(members))
+            conn.execute(
+                f"UPDATE face_cluster_members SET cluster_id = ? WHERE cluster_id = ? AND face_id IN ({ph})",
+                (new_id, cluster_id, *members),
+            )
+            conn.execute(
+                "UPDATE face_clusters SET pinned = 1, updated_at = datetime('now') WHERE id = ?",
+                (cluster_id,),
+            )
+            return new_id
+
+    def ban_face(self, face_id: int) -> bool:
+        """One transaction: drop every non-banned membership of the face and,
+        unless it is already banned, put it in its own pinned 'banned' group.
+        Returns True if a new ban was created (False: already banned or the
+        face does not exist)."""
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM library_faces WHERE id = ?", (face_id,)).fetchone() is None:
+                return False
+            conn.execute(
+                "DELETE FROM face_cluster_members WHERE face_id = ? AND cluster_id IN "
+                "(SELECT id FROM face_clusters WHERE status != 'banned')", (face_id,))
+            if conn.execute(
+                "SELECT 1 FROM face_cluster_members m JOIN face_clusters c ON c.id = m.cluster_id "
+                "WHERE m.face_id = ? AND c.status = 'banned'", (face_id,),
+            ).fetchone():
+                return False
+            bid = conn.execute(
+                "INSERT INTO face_clusters (status, name, pinned) VALUES ('banned', 'Banned faces', 1)"
+            ).lastrowid
+            conn.execute("INSERT INTO face_cluster_members (cluster_id, face_id) VALUES (?, ?)",
+                         (bid, face_id))
+            return True
+
+    def get_member_anchor(
+        self, cluster_id: int, min_count: int = 2, exclude_face_ids: Iterable[int] = (),
+    ) -> str | None:
+        """The best_match_id a strict majority of the group's anchored members
+        (other than exclude_face_ids) share, if at least min_count of them do;
+        else None."""
+        excluded = [int(f) for f in exclude_face_ids]
+        not_in = f" AND m.face_id NOT IN ({','.join('?' * len(excluded))})" if excluded else ""
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT lf.best_match_id, COUNT(*) AS n
+                FROM face_cluster_members m JOIN library_faces lf ON lf.id = m.face_id
+                WHERE m.cluster_id = ? AND lf.best_match_id IS NOT NULL{not_in}
+                GROUP BY lf.best_match_id ORDER BY n DESC, lf.best_match_id
+                """,
+                (cluster_id, *excluded),
+            ).fetchall()
+        if not rows:
+            return None
+        total = sum(r[1] for r in rows)
+        sid, n = rows[0]
+        if n >= min_count and n * 2 > total:
+            return sid
+        return None
+
+    # ---------- merge / resolve ----------
+
+    def move_faces_to_cluster(self, source_ids: list[int], target_id: int) -> dict:
+        """Atomically merge source clusters into target (one transaction).
+
+        Moves members and stash ids, logs the merge, pins the target and deletes
+        the sources. Raises ValueError (nothing modified) when there are no
+        sources left after dropping target_id, or target/sources are missing.
+        Returns {"faces_moved": int, "sources_deleted": [ids]}.
+        """
+        sources: list[int] = []
+        for sid in source_ids:
+            if sid != target_id and sid not in sources:
+                sources.append(sid)
+        if not sources:
+            raise ValueError("no source clusters")
+        placeholders = ",".join("?" * len(sources))
+        with self._connection() as conn:
+            # write lock first: existence checks and the move are one atomic step
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM face_clusters WHERE id = ?", (target_id,)).fetchone() is None:
+                raise ValueError(f"target cluster {target_id} not found")
+            found = {r[0] for r in conn.execute(
+                f"SELECT id FROM face_clusters WHERE id IN ({placeholders})", sources
+            ).fetchall()}
+            missing = [sid for sid in sources if sid not in found]
+            if missing:
+                raise ValueError(f"source clusters not found: {missing}")
+            moved = conn.execute(
+                f"""
+                INSERT OR IGNORE INTO face_cluster_members (cluster_id, face_id)
+                SELECT ?, face_id FROM face_cluster_members WHERE cluster_id IN ({placeholders})
+                """,
+                [target_id, *sources]
+            ).rowcount
+            conn.execute(
+                f"""
+                INSERT OR IGNORE INTO face_cluster_stash_ids (cluster_id, stash_id)
+                SELECT ?, stash_id FROM face_cluster_stash_ids WHERE cluster_id IN ({placeholders})
+                """,
+                [target_id, *sources]
+            )
+            conn.executemany(
+                "INSERT OR REPLACE INTO face_cluster_merge_log (source_cluster_id, target_cluster_id) VALUES (?, ?)",
+                [(sid, target_id) for sid in sources]
+            )
+            # a user merge is explicit consent to the sources' identities
+            conn.execute(
+                "DELETE FROM face_cluster_blocked_stash_ids WHERE cluster_id = ? AND stash_id IN "
+                "(SELECT stash_id FROM face_cluster_stash_ids WHERE cluster_id = ?)",
+                (target_id, target_id),
+            )
+            conn.execute(
+                "UPDATE face_clusters SET pinned = 1, updated_at = datetime('now') WHERE id = ?",
+                (target_id,)
+            )
+            conn.execute(f"DELETE FROM face_clusters WHERE id IN ({placeholders})", sources)
+        return {"faces_moved": moved, "sources_deleted": sources}
+
+    def resolve_cluster_id(self, cluster_id: int) -> int | None:
+        """Live cluster id for cluster_id: itself if it exists, else its merge target
+        (following chains) if that exists, else None."""
+        with self._connection() as conn:
+            if conn.execute("SELECT 1 FROM face_clusters WHERE id = ?", (cluster_id,)).fetchone():
+                return cluster_id
+        final = self.get_cluster_merge_map().get(cluster_id)
+        if final is None or final == cluster_id:
+            return None
+        with self._connection() as conn:
+            if conn.execute("SELECT 1 FROM face_clusters WHERE id = ?", (final,)).fetchone():
+                return final
+        return None
+
+    # ---------- bulk helpers ----------
+
+    def clear_cluster_members(self, cluster_id: int, only_unpinned: bool = False) -> int | None:
+        """Remove all members. only_unpinned: do nothing (return None) if the
+        cluster is pinned or gone at write time."""
+        with self._connection() as conn:
+            if only_unpinned:
+                conn.execute("BEGIN IMMEDIATE")
+                if conn.execute(
+                    "SELECT 1 FROM face_clusters WHERE id = ? AND pinned = 0", (cluster_id,)
+                ).fetchone() is None:
+                    return None
+            return conn.execute(
+                "DELETE FROM face_cluster_members WHERE cluster_id = ?", (cluster_id,)
+            ).rowcount
+
+    def delete_empty_clusters(
+        self, statuses: tuple[str, ...] = ("open", "matched"), include_pinned: bool = False,
+    ) -> int:
+        """Delete clusters in these statuses with zero members. Pinned clusters
+        are kept unless include_pinned (a pinned empty group may be one a user
+        operation is filling right now, e.g. a split or a merge target)."""
+        if not statuses:
+            return 0
+        placeholders = ",".join("?" * len(statuses))
+        with self._connection() as conn:
+            return conn.execute(
+                f"""
+                DELETE FROM face_clusters
+                WHERE status IN ({placeholders})
+                  {"" if include_pinned else "AND pinned = 0"}
+                  AND NOT EXISTS (SELECT 1 FROM face_cluster_members m WHERE m.cluster_id = face_clusters.id)
+                """,
+                list(statuses)
+            ).rowcount
+
+    def get_scene_ids_for_faces(self, face_ids: list[int]) -> list[int]:
+        """Distinct, sorted scene ids of the given faces."""
+        if not face_ids:
+            return []
+        scenes: set[int] = set()
+        ids = list(face_ids)
+        with self._connection() as conn:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                placeholders = ",".join("?" * len(chunk))
+                scenes.update(r[0] for r in conn.execute(
+                    f"SELECT DISTINCT stash_scene_id FROM library_faces WHERE id IN ({placeholders})",
+                    chunk
+                ).fetchall())
+        return sorted(scenes)
+
+    # ---------- rejection memory ----------
+
+    def add_face_rejections(
+        self,
+        face_ids: list[int],
+        cluster_id: int | None = None,
+        performer_id: str | None = None,
+        stash_ids: Iterable[str] = (),
+    ) -> int:
+        """Remember that faces must not rejoin a cluster / performer / stash id.
+
+        Returns rows inserted (existing rejections count 0).
+        """
+        refs: list[tuple[str, str]] = []
+        if cluster_id is not None:
+            refs.append(("cluster", str(cluster_id)))
+        if performer_id is not None:
+            refs.append(("performer", str(performer_id)))
+        refs.extend(("stash_id", s) for s in stash_ids if s is not None)
+        if not face_ids or not refs:
+            return 0
+        inserted = 0
+        with self._connection() as conn:
+            for fid in face_ids:
+                for kind, ref in refs:
+                    inserted += conn.execute(
+                        "INSERT OR IGNORE INTO face_rejections (face_id, kind, ref) VALUES (?, ?, ?)",
+                        (fid, kind, ref)
+                    ).rowcount
+        return inserted
+
+    def get_face_rejections(self, face_ids: list[int] | None = None) -> dict[int, dict]:
+        """{face_id: {"clusters": set[int], "performers": set[str], "stash_ids": set[str]}}.
+
+        Only faces with at least one rejection appear. face_ids=None means all faces.
+        """
+        rows: list = []
+        with self._connection() as conn:
+            if face_ids is None:
+                rows = conn.execute("SELECT face_id, kind, ref FROM face_rejections").fetchall()
+            else:
+                ids = list(face_ids)
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    placeholders = ",".join("?" * len(chunk))
+                    rows.extend(conn.execute(
+                        f"SELECT face_id, kind, ref FROM face_rejections WHERE face_id IN ({placeholders})",
+                        chunk
+                    ).fetchall())
+        result: dict[int, dict] = {}
+        for fid, kind, ref in rows:
+            entry = result.setdefault(fid, {"clusters": set(), "performers": set(), "stash_ids": set()})
+            if kind == "cluster":
+                try:
+                    entry["clusters"].add(int(ref))
+                except ValueError:
+                    pass
+            elif kind == "performer":
+                entry["performers"].add(ref)
+            elif kind == "stash_id":
+                entry["stash_ids"].add(ref)
+        return result
+
+    def clear_face_rejections(self, face_ids: list[int]) -> int:
+        if not face_ids:
+            return 0
+        removed = 0
+        ids = list(face_ids)
+        with self._connection() as conn:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                placeholders = ",".join("?" * len(chunk))
+                removed += conn.execute(
+                    f"DELETE FROM face_rejections WHERE face_id IN ({placeholders})", chunk
+                ).rowcount
+        return removed
+
+    # ---------- re-identify upsert ----------
+
+    def upsert_scene_library_faces(
+        self,
+        stash_scene_id: int,
+        faces: list[dict],
+        iou_threshold: float = 0.5,
+        time_tolerance_sec: float = 0.5,
+        emb_threshold: float = 0.3,
+        pair_emb_threshold: float = 0.5,
+    ) -> dict:
+        """Replace a scene's faces with a fresh detection set, keeping face ids.
+
+        Each face dict takes the library_faces columns (frame_index, timestamp_sec,
+        bbox, det_confidence, yaw, facenet_emb, arcface_emb, crop_path,
+        best_match_id, best_match_name, best_match_confidence, db_version).
+
+        New faces are matched one-to-one to existing rows (same frame + IoU >=
+        iou_threshold, greedy by IoU; then, for faces left over, same frame +
+        embedding cosine distance <= emb_threshold, which pairs a re-encoded
+        file whose boxes moved with the resolution). A box pair also needs the
+        embeddings to agree (cosine distance <= pair_emb_threshold): a different
+        person at the same spot is a new face, not the old row, so it never
+        inherits that row's memberships, ban or rejections; such a pair is
+        treated as unmatched on both sides. An identical key (frame, moment
+        and box) is the same detection and pairs regardless. Matched rows are updated in place so their
+        cluster memberships and rejections survive. Unmatched old rows are deleted
+        unless curated (member of an assigned/ignored/banned or pinned cluster, or
+        with any rejection), which are retained untouched. Unmatched new faces are
+        inserted. All in one transaction.
+
+        Returns {"face_ids": [id | None, ...] parallel to faces, "updated",
+        "inserted", "deleted", "retained", "conflicts", "stale_crop_paths"}.
+        stale_crop_paths lists crop files no row references any more (deleted
+        rows, replaced paths of updated rows, and the new paths of faces that
+        could not be stored).
+        """
+        face_ids: list[int | None] = [None] * len(faces)
+        updated = inserted = deleted = retained = conflicts = 0
+        candidate_stale: list[str] = []
+
+        with self._connection() as conn:
+            # Take the write lock before reading: a ban / assign / eject that
+            # commits between computing `curated` and the DELETE would
+            # otherwise be cascaded away with a row judged uncurated.
+            conn.execute("BEGIN IMMEDIATE")
+            old_rows = [dict(r) for r in conn.execute(
+                """
+                SELECT lf.id, lf.frame_index, lf.timestamp_sec,
+                       lf.bbox_x, lf.bbox_y, lf.bbox_w, lf.bbox_h, lf.crop_path,
+                       lf.facenet_emb, lf.arcface_emb,
+                       (EXISTS (
+                            SELECT 1 FROM face_cluster_members m
+                            JOIN face_clusters c ON c.id = m.cluster_id
+                            WHERE m.face_id = lf.id
+                              AND (c.status IN ('assigned', 'ignored', 'banned') OR c.pinned = 1))
+                        OR EXISTS (SELECT 1 FROM face_rejections r WHERE r.face_id = lf.id)
+                       ) AS curated
+                FROM library_faces lf
+                WHERE lf.stash_scene_id = ?
+                ORDER BY lf.id
+                """,
+                (stash_scene_id,)
+            ).fetchall()]
+
+            def same_frame(new: dict, old: dict) -> bool:
+                nt, ot = new.get("timestamp_sec"), old["timestamp_sec"]
+                if nt is not None and ot is not None:
+                    return abs(float(nt) - float(ot)) <= time_tolerance_sec
+                return new.get("frame_index") == old["frame_index"]
+
+            new_vecs = [_unit_face_vec(f.get("facenet_emb"), f.get("arcface_emb")) for f in faces]
+            old_vecs = [_unit_face_vec(o["facenet_emb"], o["arcface_emb"]) for o in old_rows]
+
+            def emb_dist(i: int, j: int) -> float | None:
+                nv, ov = new_vecs[i], old_vecs[j]
+                if nv is None or ov is None or nv.shape != ov.shape:
+                    return None
+                return 1.0 - float(nv @ ov)
+
+            def same_key(new: dict, old: dict) -> bool:
+                # Identical UNIQUE key (frame, moment, box): the same pixels,
+                # so the same detection whatever the embeddings say; it could
+                # not be stored next to the old row anyway.
+                nb = new.get("bbox") or {}
+                nt, ot = new.get("timestamp_sec"), old["timestamp_sec"]
+                return (new.get("frame_index") == old["frame_index"]
+                        and (nt is None) == (ot is None)
+                        and (nt is None or float(nt) == float(ot))
+                        and all(float(nb.get(k, 0) or 0) == float(old[f"bbox_{k}"])
+                                for k in ("x", "y", "w", "h")))
+
+            pairs: list[tuple[float, int, int]] = []
+            for i, new in enumerate(faces):
+                nb = new.get("bbox") or {}
+                for j, old in enumerate(old_rows):
+                    if not same_frame(new, old):
+                        continue
+                    iou = _bbox_iou(nb, {"x": old["bbox_x"], "y": old["bbox_y"],
+                                         "w": old["bbox_w"], "h": old["bbox_h"]})
+                    if iou >= iou_threshold:
+                        d = emb_dist(i, j)
+                        if d is not None and d > pair_emb_threshold and not same_key(new, old):
+                            continue   # same spot, different person
+                        nt, ot = new.get("timestamp_sec"), old["timestamp_sec"]
+                        dt = abs(float(nt) - float(ot)) if nt is not None and ot is not None else 0.0
+                        pairs.append((iou, dt, i, j))
+            # Ties on IoU go to the closest moment: a new face whose key equals
+            # an old row's key always pairs with that row, so a paired update
+            # never needs a key another row still holds.
+            pairs.sort(key=lambda p: (-p[0], p[1], p[2], p[3]))
+            new_to_old: dict[int, int] = {}
+            used_old: set[int] = set()
+            for _iou, _dt, i, j in pairs:
+                if i in new_to_old or j in used_old:
+                    continue
+                new_to_old[i] = j
+                used_old.add(j)
+
+            # Fallback for faces the boxes cannot pair (file replaced at another
+            # resolution: same moments, scaled boxes): same frame and nearly
+            # identical embedding is the same detection.
+            emb_pairs: list[tuple[float, int, int]] = []
+            for i, new in enumerate(faces):
+                if i in new_to_old:
+                    continue
+                for j, old in enumerate(old_rows):
+                    if j in used_old or not same_frame(new, old):
+                        continue
+                    dist = emb_dist(i, j)
+                    if dist is not None and dist <= emb_threshold:
+                        emb_pairs.append((dist, i, j))
+            for _d, i, j in sorted(emb_pairs):
+                if i in new_to_old or j in used_old:
+                    continue
+                new_to_old[i] = j
+                used_old.add(j)
+
+            # Delete first so freed UNIQUE keys can be reused by updates/inserts.
+            for j, old in enumerate(old_rows):
+                if j in used_old:
+                    continue
+                if old["curated"]:
+                    retained += 1
+                    continue
+                conn.execute("DELETE FROM library_faces WHERE id = ?", (old["id"],))
+                deleted += 1
+                if old["crop_path"]:
+                    candidate_stale.append(old["crop_path"])
+
+            def update_paired(i: int, j: int) -> None:
+                new, old = faces[i], old_rows[j]
+                bbox = new.get("bbox") or {}
+                conn.execute(
+                    """
+                    UPDATE library_faces SET
+                        frame_index = ?, timestamp_sec = ?,
+                        bbox_x = ?, bbox_y = ?, bbox_w = ?, bbox_h = ?,
+                        det_confidence = ?, yaw = ?,
+                        facenet_emb = ?, arcface_emb = ?, crop_path = ?,
+                        best_match_id = ?, best_match_name = ?, best_match_confidence = ?,
+                        db_version = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        new.get("frame_index"), new.get("timestamp_sec"),
+                        bbox.get("x", 0), bbox.get("y", 0), bbox.get("w", 0), bbox.get("h", 0),
+                        new.get("det_confidence"), new.get("yaw"),
+                        new.get("facenet_emb"), new.get("arcface_emb"), new.get("crop_path"),
+                        new.get("best_match_id"), new.get("best_match_name"),
+                        new.get("best_match_confidence"), new.get("db_version"),
+                        old["id"],
+                    )
+                )
+
+            # The UNIQUE key is checked per statement, so a paired update can
+            # collide with another paired row that has not moved yet. Retry the
+            # collisions after the others went through, until no progress.
+            pending = sorted(new_to_old.items())
+            while pending:
+                blocked: list[tuple[int, int]] = []
+                for i, j in pending:
+                    try:
+                        update_paired(i, j)
+                    except sqlite3.IntegrityError:
+                        blocked.append((i, j))
+                        continue
+                    new, old = faces[i], old_rows[j]
+                    updated += 1
+                    face_ids[i] = old["id"]
+                    if old["crop_path"] and old["crop_path"] != new.get("crop_path"):
+                        candidate_stale.append(old["crop_path"])
+                if len(blocked) == len(pending):
+                    break
+                pending = blocked
+            else:
+                blocked = []
+
+            for i, j in blocked:
+                # UNIQUE key collides with a retained row: keep this row's
+                # detection data, but refresh its identify-time anchor so a
+                # stale best match does not linger.
+                new, old = faces[i], old_rows[j]
+                conn.execute(
+                    """
+                    UPDATE library_faces SET best_match_id = ?, best_match_name = ?,
+                        best_match_confidence = ?, db_version = ?
+                    WHERE id = ?
+                    """,
+                    (new.get("best_match_id"), new.get("best_match_name"),
+                     new.get("best_match_confidence"), new.get("db_version"), old["id"]),
+                )
+                conflicts += 1
+                face_ids[i] = old["id"]
+                if new.get("crop_path") and new.get("crop_path") != old["crop_path"]:
+                    candidate_stale.append(new["crop_path"])
+
+            for i, new in enumerate(faces):
+                if i in new_to_old:
+                    continue
+                bbox = new.get("bbox") or {}
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO library_faces (
+                        stash_scene_id, frame_index, timestamp_sec,
+                        bbox_x, bbox_y, bbox_w, bbox_h, det_confidence, yaw,
+                        facenet_emb, arcface_emb, crop_path,
+                        best_match_id, best_match_name, best_match_confidence, db_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        stash_scene_id, new.get("frame_index"), new.get("timestamp_sec"),
+                        bbox.get("x", 0), bbox.get("y", 0), bbox.get("w", 0), bbox.get("h", 0),
+                        new.get("det_confidence"), new.get("yaw"),
+                        new.get("facenet_emb"), new.get("arcface_emb"), new.get("crop_path"),
+                        new.get("best_match_id"), new.get("best_match_name"),
+                        new.get("best_match_confidence"), new.get("db_version"),
+                    )
+                )
+                if cursor.rowcount:
+                    face_ids[i] = cursor.lastrowid
+                    inserted += 1
+                elif new.get("crop_path"):
+                    candidate_stale.append(new["crop_path"])
+
+            stale: list[str] = []
+            for path in dict.fromkeys(candidate_stale):
+                if conn.execute(
+                    "SELECT 1 FROM library_faces WHERE crop_path = ? LIMIT 1", (path,)
+                ).fetchone() is None:
+                    stale.append(path)
+
+        return {
+            "face_ids": face_ids,
+            "updated": updated,
+            "inserted": inserted,
+            "deleted": deleted,
+            "retained": retained,
+            "conflicts": conflicts,
+            "stale_crop_paths": stale,
+        }
 
     # ==================== Image Fingerprints ====================
 

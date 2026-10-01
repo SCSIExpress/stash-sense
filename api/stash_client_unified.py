@@ -486,6 +486,28 @@ class StashClientUnified:
             return None
         return {"id": scene["id"], "performer_ids": [p["id"] for p in scene.get("performers") or []]}
 
+    def get_performer_stash_ids_sync(self, performer_id: str) -> Optional[list[dict]]:
+        """A local performer's stash-box ids (synchronous).
+
+        Returns [{"endpoint", "stash_id"}, ...], or None if the performer is not found.
+        """
+        query = """
+        query GetPerformerStashIds($id: ID!) {
+          findPerformer(id: $id) {
+            id
+            stash_ids { endpoint stash_id }
+          }
+        }
+        """
+        data = self._execute_sync(query, {"id": performer_id})
+        performer = data.get("findPerformer")
+        if performer is None:
+            return None
+        return [
+            {"endpoint": s.get("endpoint"), "stash_id": s.get("stash_id")}
+            for s in performer.get("stash_ids") or []
+        ]
+
     def update_scene_performers_sync(self, scene_id: str, performer_ids: list[str]) -> None:
         """Update the performers for a scene (synchronous)."""
         query = """

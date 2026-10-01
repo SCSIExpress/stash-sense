@@ -13,7 +13,7 @@ from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 import face_config
 from recognizer import FaceRecognizer, PerformerMatch, RecognitionResult
@@ -32,6 +32,7 @@ from scene_matcher import (
     aggregate_matches,
     frequency_based_matching,
     clustered_frequency_matching,
+    cluster_mode_matching,
     hybrid_matching,
 )
 from stashbox_utils import _get_stashbox_client, _extract_endpoint
@@ -229,6 +230,10 @@ class PersonResult(BaseModel):
     all_matches: list[PerformerMatchResponse] = Field(description="All potential matches")
     signals_used: list[str] = Field(default_factory=list, description="Signals used for matching, e.g. ['face', 'body', 'tattoo']")
     tattoos_detected: int = Field(0, description="Number of YOLO tattoo detections in this person's frames")
+    # Indices into identify_scene's all_results of the faces this person covers.
+    # Internal only (not serialized); set by scene_matcher.set_face_indices and
+    # used to anchor persisted library faces to the person that claimed them.
+    _face_indices: list[int] = PrivateAttr(default_factory=list)
 
 
 class SceneIdentifyResponse(BaseModel):
@@ -747,6 +752,14 @@ async def identify_gallery(request: GalleryIdentifyRequest, _=Depends(require_db
     )
 
 
+
+async def _persist_library_faces_off_loop(**kwargs) -> int:
+    """Run persist_from_identify on a worker thread: it writes crops and a
+    SQLite transaction that can wait (busy timeout) on a running face-group
+    build, which must not stall the event loop shared by every request."""
+    from library_face_persist import persist_from_identify
+    return await asyncio.to_thread(persist_from_identify, **kwargs)
+
 @router.post("/identify/scene", response_model=SceneIdentifyResponse)
 async def identify_scene(request: SceneIdentifyRequest, _=Depends(require_db_available)):
     """
@@ -1008,60 +1021,12 @@ async def identify_scene(request: SceneIdentifyRequest, _=Depends(require_db_ava
         # Cluster-based matching (original approach)
         print(f"[identify_scene] [{time.time()-t_start:.1f}s] Using cluster matching...")
 
-        # Cluster faces by person
-        clusters = cluster_faces_by_person(
+        persons = cluster_mode_matching(
             all_results,
             _recognizer,
-            distance_threshold=request.cluster_threshold,
+            cluster_threshold=request.cluster_threshold,
+            top_k=request.top_k,
         )
-        print(f"[identify_scene] Initial clusters: {len(clusters)}")
-
-        # Merge clusters that have the same best match
-        clusters = merge_clusters_by_match(clusters)
-        print(f"[identify_scene] After merge: {len(clusters)} clusters")
-
-        # Build response with deduplication
-        persons = []
-        used_performers: set[str] = set()  # Track which performers we've assigned
-
-        # First pass: build all persons sorted by frame count
-        all_persons = []
-        for person_id, cluster in enumerate(clusters):
-            aggregated_matches = aggregate_matches(cluster, top_k=request.top_k)
-            all_persons.append((len(cluster), PersonResult(
-                person_id=person_id,
-                frame_count=len(cluster),
-                best_match=aggregated_matches[0] if aggregated_matches else None,
-                all_matches=aggregated_matches,
-            )))
-
-        # Sort by frame count (most prominent people first)
-        all_persons.sort(key=lambda x: x[0], reverse=True)
-
-        # Second pass: deduplicate - each performer can only be the best match once
-        for _, person in all_persons:
-            if person.best_match:
-                if person.best_match.stashdb_id in used_performers:
-                    # This performer already assigned to a more prominent person
-                    # Find next best match that isn't used
-                    for alt_match in person.all_matches[1:]:
-                        if alt_match.stashdb_id not in used_performers:
-                            person.best_match = alt_match
-                            used_performers.add(alt_match.stashdb_id)
-                            break
-                    else:
-                        # No unused matches, set best_match to None
-                        person.best_match = None
-                else:
-                    used_performers.add(person.best_match.stashdb_id)
-
-            # Also filter all_matches to not include already-used performers
-            person.all_matches = [m for m in person.all_matches if m.stashdb_id not in used_performers or m.stashdb_id == (person.best_match.stashdb_id if person.best_match else None)]
-            persons.append(person)
-
-        # Re-assign person IDs after sorting
-        for i, person in enumerate(persons):
-            person.person_id = i
 
     # Apply multi-signal re-ranking if signals were extracted
     if ms_used and _multi_signal_matcher is not None:
@@ -1113,16 +1078,15 @@ async def identify_scene(request: SceneIdentifyRequest, _=Depends(require_db_ava
 
     # Persist per-face records (embeddings + crops) for library face grouping
     try:
-        from library_face_persist import persist_from_identify
-        _saved_faces = persist_from_identify(
+        # all_results[i] is detected_faces[i] (screenshot faces come after)
+        face_matches = [r.matches for _f, r in all_results[: len(detected_faces)]]
+        _saved_faces = await _persist_library_faces_off_loop(
             scene_id=int(request.scene_id),
             extraction_frames=extraction_result.frames,
             detected_faces=detected_faces,
             embeddings=embeddings,
-            all_results=all_results,
             persons=persons,
-            recognizer=_recognizer,
-            cluster_threshold=request.cluster_threshold,
+            face_matches=face_matches,
             db_version=_db_manifest.get("version"),
         )
         if _saved_faces:

@@ -6,16 +6,98 @@ Provides algorithms for identifying performers across multiple video frames:
 - Clustered frequency matching (clustered_frequency_matching)
 - Hybrid matching combining cluster and frequency (hybrid_matching)
 - Multi-signal re-ranking with body/tattoo signals (_rerank_scene_persons)
+
+Every PersonResult these strategies return carries the indices (positions in
+all_results) of the faces it covers, via set_face_indices/get_face_indices.
+Library-face persistence uses them to anchor each stored face to the person
+identify actually returned.
 """
+
+from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from typing import TYPE_CHECKING, Iterable
 
 import numpy as np
 
-from recognizer import FaceRecognizer, PerformerMatch, RecognitionResult
+if TYPE_CHECKING:
+    from recognizer import FaceRecognizer, PerformerMatch, RecognitionResult
 
 logger = logging.getLogger(__name__)
+
+
+def set_face_indices(person, indices: Iterable[int]) -> None:
+    """Attach the all_results indices of the faces this person covers."""
+    person._face_indices = sorted(set(int(i) for i in indices))
+
+
+def get_face_indices(person) -> list[int]:
+    """Face indices attached by set_face_indices ([] if none)."""
+    return getattr(person, "_face_indices", None) or []
+
+
+def _result_index_map(all_results) -> dict[int, int]:
+    """id(RecognitionResult) -> its index in all_results."""
+    return {id(result): i for i, (_frame, result) in enumerate(all_results)}
+
+
+def _cluster_indices(cluster, idx_map: dict[int, int]) -> list[int]:
+    """all_results indices of the faces in a cluster."""
+    return sorted(idx_map[id(r)] for _f, r in cluster if id(r) in idx_map)
+
+
+def _claim_faces_by_match(
+    all_results,
+    persons: list,
+    max_distance: float,
+    claimed: set[int],
+    owned: list[set[int]] | None = None,
+) -> dict[int, int]:
+    """Give unclaimed faces to the final person that is their own top match.
+
+    A face in `claimed` is skipped. Otherwise its lowest-score match is taken;
+    if that score is within max_distance and its stashdb_id is a final
+    person's best match, the face goes to that person. A face whose top match
+    is someone else is never handed to a final person through a weaker,
+    secondary match (a co-star who merely resembles them).
+
+    A person owns at most one face per frame: two faces in one frame are two
+    different people. Candidates are taken closest first, and frames the
+    person already owns (via `owned`, parallel to persons) are skipped.
+
+    Returns {face index: person index}.
+    """
+    person_by_sid: dict[str, int] = {}
+    for k, p in enumerate(persons):
+        bm = getattr(p, "best_match", None)
+        if bm is not None and bm.stashdb_id not in person_by_sid:
+            person_by_sid[bm.stashdb_id] = k
+
+    taken: set[tuple[int, object]] = set()
+    if owned is not None:
+        for k, faces in enumerate(owned):
+            for i in faces:
+                taken.add((k, all_results[i][0]))
+
+    candidates: list[tuple[float, int, int]] = []
+    for i, (_frame, result) in enumerate(all_results):
+        if i in claimed or not result.matches:
+            continue
+        top = min(result.matches, key=lambda m: m.combined_score)
+        k = person_by_sid.get(top.stashdb_id)
+        if k is None or top.combined_score > max_distance:
+            continue
+        candidates.append((top.combined_score, i, k))
+
+    claims: dict[int, int] = {}
+    for _score, i, k in sorted(candidates):
+        key = (k, all_results[i][0])
+        if key in taken:
+            continue
+        taken.add(key)
+        claims[i] = k
+    return claims
 
 
 def _extract_scene_signals(
@@ -468,6 +550,10 @@ def frequency_based_matching(
             all_matches=[resp],
         ))
 
+    claims = _claim_faces_by_match(all_results, persons, max_distance, claimed=set())
+    for k, person in enumerate(persons):
+        set_face_indices(person, [i for i, pk in claims.items() if pk == k])
+
     return persons
 
 
@@ -514,6 +600,7 @@ def clustered_frequency_matching(
     clusters = merge_clusters_by_match(clusters)
 
     print(f"[clustered_freq] {len(all_results)} face detections -> {len(clusters)} person clusters")
+    idx_map = _result_index_map(all_results)
 
     # Step 2: For each cluster, run frequency matching to find the best performer
     persons = []
@@ -525,6 +612,7 @@ def clustered_frequency_matching(
     for cluster_idx, cluster in sorted_clusters:
         cluster_size = len(cluster)
         unique_frames = len(set(frame_idx for frame_idx, _ in cluster))
+        face_indices = _cluster_indices(cluster, idx_map)
 
         # Collect all matches from faces in this cluster
         performer_matches: dict[str, list[tuple[float, PerformerMatch, int]]] = defaultdict(list)
@@ -544,6 +632,7 @@ def clustered_frequency_matching(
                 best_match=None,
                 all_matches=[],
             ))
+            set_face_indices(persons[-1], face_indices)
             continue
 
         # Score each performer within this cluster
@@ -601,6 +690,7 @@ def clustered_frequency_matching(
                 best_match=None,
                 all_matches=[],
             ))
+            set_face_indices(persons[-1], face_indices)
             continue
 
         # Build all_matches list: best first, then alternatives (up to top_k)
@@ -624,6 +714,7 @@ def clustered_frequency_matching(
             best_match=best_response,
             all_matches=all_matches,
         ))
+        set_face_indices(persons[-1], face_indices)
 
     # Sort: persons with matches first (by frame count desc), then unknowns
     persons.sort(key=lambda p: (p.best_match is not None, p.frame_count), reverse=True)
@@ -694,6 +785,8 @@ def hybrid_matching(
     clusters = merge_clusters_by_match(clusters)
 
     cluster_persons = []
+    # aggregated top stashdb_id -> every post-merge cluster with that top id
+    clusters_by_top_id: dict[str, list] = defaultdict(list)
     for cluster in clusters:
         aggregated = aggregate_matches(
             cluster, top_k=3,
@@ -701,6 +794,7 @@ def hybrid_matching(
             _distance_to_confidence=_distance_to_confidence,
         )
         if aggregated:
+            clusters_by_top_id[aggregated[0].stashdb_id].append(cluster)
             cluster_persons.append({
                 "stashdb_id": aggregated[0].stashdb_id,
                 "name": aggregated[0].name,
@@ -789,5 +883,107 @@ def hybrid_matching(
             best_match=resp,
             all_matches=[resp],
         ))
+
+    # Face ownership: a person first claims the faces of every cluster whose
+    # aggregated top match is that person; a remaining face goes to the final
+    # person that is its own top match (at most one face per person per
+    # frame). Clusters partition the faces, so each face ends up with at most
+    # one person.
+    idx_map = _result_index_map(all_results)
+    owned: list[set[int]] = [set() for _ in persons]
+    claimed: set[int] = set()
+    for k, person in enumerate(persons):
+        for cluster in clusters_by_top_id.get(person.best_match.stashdb_id, []):
+            for i in _cluster_indices(cluster, idx_map):
+                if i not in claimed:
+                    owned[k].add(i)
+                    claimed.add(i)
+    for i, k in _claim_faces_by_match(all_results, persons, max_distance, claimed, owned).items():
+        owned[k].add(i)
+    for person, faces in zip(persons, owned):
+        set_face_indices(person, faces)
+
+    return persons
+
+
+def cluster_mode_matching(
+    all_results: list[tuple[int, RecognitionResult]],
+    recognizer: "FaceRecognizer",
+    cluster_threshold: float = 0.6,
+    top_k: int = 5,
+    _match_to_response=None,
+    _distance_to_confidence=None,
+) -> list:
+    """Cluster-based matching (the original identify_scene approach).
+
+    Greedy-clusters faces, merges clusters with the same top match, builds
+    one PersonResult per cluster from aggregated matches, sorts by cluster
+    size, and makes sure each performer is the best match at most once.
+    Each person carries its cluster's face indices.
+    """
+    from identification_router import PersonResult
+
+    clusters = cluster_faces_by_person(
+        all_results,
+        recognizer,
+        distance_threshold=cluster_threshold,
+    )
+    print(f"[identify_scene] Initial clusters: {len(clusters)}")
+
+    # Merge clusters that have the same best match
+    clusters = merge_clusters_by_match(clusters)
+    print(f"[identify_scene] After merge: {len(clusters)} clusters")
+
+    idx_map = _result_index_map(all_results)
+    agg_kwargs = {}
+    if _match_to_response is not None:
+        agg_kwargs["_match_to_response"] = _match_to_response
+    if _distance_to_confidence is not None:
+        agg_kwargs["_distance_to_confidence"] = _distance_to_confidence
+
+    # Build response with deduplication
+    persons = []
+    used_performers: set[str] = set()  # Track which performers we've assigned
+
+    # First pass: build all persons sorted by frame count
+    all_persons = []
+    for person_id, cluster in enumerate(clusters):
+        aggregated_matches = aggregate_matches(cluster, top_k=top_k, **agg_kwargs)
+        person = PersonResult(
+            person_id=person_id,
+            frame_count=len(cluster),
+            best_match=aggregated_matches[0] if aggregated_matches else None,
+            all_matches=aggregated_matches,
+        )
+        set_face_indices(person, _cluster_indices(cluster, idx_map))
+        all_persons.append((len(cluster), person))
+
+    # Sort by frame count (most prominent people first)
+    all_persons.sort(key=lambda x: x[0], reverse=True)
+
+    # Second pass: deduplicate - each performer can only be the best match once
+    for _, person in all_persons:
+        if person.best_match:
+            if person.best_match.stashdb_id in used_performers:
+                # This performer already assigned to a more prominent person
+                # Find next best match that isn't used
+                for alt_match in person.all_matches[1:]:
+                    if alt_match.stashdb_id not in used_performers:
+                        person.best_match = alt_match
+                        used_performers.add(alt_match.stashdb_id)
+                        break
+                else:
+                    # No unused matches, set best_match to None
+                    person.best_match = None
+            else:
+                used_performers.add(person.best_match.stashdb_id)
+
+        # Also filter all_matches to not include already-used performers
+        person.all_matches = [m for m in person.all_matches if m.stashdb_id not in used_performers or m.stashdb_id == (person.best_match.stashdb_id if person.best_match else None)]
+        persons.append(person)
+
+    # Re-assign person IDs after sorting
+    for i, person in enumerate(persons):
+        person.person_id = i
 
     return persons

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import secrets
 from pathlib import Path
 
 import cv2
@@ -24,8 +25,23 @@ class LibraryFaceStore:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def save_crop(self, scene_id: int, frame_index: int, bbox: dict, frame_image: np.ndarray) -> str:
-        """Save a face crop as JPEG, return the relative path."""
+    def save_crop(
+        self,
+        scene_id: int,
+        frame_index: int,
+        bbox: dict,
+        frame_image: np.ndarray,
+        timestamp_sec: float | None = None,
+    ) -> str:
+        """Save a face crop as JPEG, return the relative path.
+
+        Every call writes a new file (the key ends in a random nonce), so a
+        crop is only ever referenced by the one write that saved it. Two
+        concurrent identifies of a scene save crops before taking the DB lock
+        and delete stale ones after commit; with shared keys one could unlink
+        a file the other had just re-saved and committed. It also means a kept
+        row's crop is never overwritten by a later detection.
+        """
         x, y = int(bbox.get("x", 0)), int(bbox.get("y", 0))
         w, h = int(bbox.get("w", 0)), int(bbox.get("h", 0))
         img_h, img_w = frame_image.shape[:2]
@@ -40,7 +56,10 @@ class LibraryFaceStore:
         if long_side > 160:
             scale = 160 / long_side
             crop = cv2.resize(crop, (int(crop.shape[1] * scale), int(crop.shape[0] * scale)), interpolation=cv2.INTER_AREA)
-        key = hashlib.sha1(f"{scene_id}:{frame_index}:{x}:{y}".encode()).hexdigest()[:16]
+        ident = f"{scene_id}:{frame_index}:{x}:{y}:{w}:{h}"
+        if timestamp_sec is not None:
+            ident += f":{float(timestamp_sec):.3f}"
+        key = f"{hashlib.sha1(ident.encode()).hexdigest()[:16]}-{secrets.token_hex(4)}"
         rel = f"{scene_id // 1000}/{key}.jpg"
         path = self._shard_dir(scene_id) / f"{key}.jpg"
         # cv2 expects BGR; imwrite returns False (not exception) on failure
@@ -57,6 +76,29 @@ class LibraryFaceStore:
             return path.read_bytes()
         except OSError:
             return None
+
+    def delete_crop(self, rel_path: str) -> bool:
+        """Delete a stored crop. Returns True if a file was removed.
+
+        Refuses (returns False) any path that does not resolve to a file under
+        the store's base directory, so a bad crop_path can never delete
+        anything outside library_faces/.
+        """
+        if not rel_path:
+            return False
+        base = self.base.resolve()
+        path = (base / rel_path).resolve()
+        if path == base or not path.is_relative_to(base):
+            logger.warning("refusing to delete crop outside store: %r", rel_path)
+            return False
+        if not path.is_file():
+            return False
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("failed to delete crop %s", path, exc_info=True)
+            return False
+        return True
 
     def disk_usage(self) -> int:
         total = 0

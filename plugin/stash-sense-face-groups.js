@@ -56,6 +56,140 @@
   let selectionMode = false;
   let selectedClusters = new Set();
   let currentFilter = null; // null = all
+  let clustersById = new Map();
+
+  // ==================== Merge target selection ====================
+
+  // Pure function: choose which of the selected clusters absorbs the others.
+  //   - assigned groups win over unassigned ones (never delete a performer link)
+  //   - among same-priority candidates, the one with the most faces wins
+  //   - ties go to the lowest cluster id
+  //   - ignored groups only merge with other ignored groups (either way would
+  //     silently hide faces or silently drop the ignore decision)
+  //   - banned groups never merge (the server refuses them too)
+  // clusters: array of {id, status, face_count, performer_id, performer_name, name}
+  function chooseMergeTarget(clusters) {
+    if (!clusters || clusters.length < 2) {
+      return { targetId: null, sourceIds: [], error: 'Select at least two groups' };
+    }
+
+    if (clusters.some(c => c.status === 'banned')) {
+      return {
+        targetId: null,
+        sourceIds: [],
+        error: 'Banned faces cannot be merged. Unban them from the Banned faces list first.',
+      };
+    }
+
+    const ignoredCount = clusters.filter(c => c.status === 'ignored').length;
+    if (ignoredCount && ignoredCount !== clusters.length) {
+      return {
+        targetId: null,
+        sourceIds: [],
+        error: 'Ignored groups can only be merged with other ignored groups. Un-ignore it first or deselect it.',
+      };
+    }
+
+    const assigned = clusters.filter(c => c.status === 'assigned');
+    if (assigned.length) {
+      // same rule as the server: an assigned group without a performer id
+      // does not conflict with anyone
+      const performerIds = new Set(assigned.filter(c => c.performer_id != null && c.performer_id !== '')
+        .map(c => String(c.performer_id)));
+      if (performerIds.size > 1) {
+        const names = assigned.map(c => c.performer_name || c.performer_id).join(', ');
+        return {
+          targetId: null,
+          sourceIds: [],
+          error: `Selected groups are assigned to different performers: ${names}. Deselect one.`,
+        };
+      }
+    }
+
+    // same rule as the server: a performer group is never absorbed by an
+    // assigned group without a performer id
+    const withPerformer = assigned.filter(c => c.performer_id != null && c.performer_id !== '');
+    const candidates = withPerformer.length ? withPerformer : assigned.length ? assigned : clusters;
+    const target = candidates.reduce((best, c) => {
+      if (!best) return c;
+      if (c.face_count > best.face_count) return c;
+      if (c.face_count === best.face_count && c.id < best.id) return c;
+      return best;
+    }, null);
+
+    const sourceIds = clusters.filter(c => c.id !== target.id).map(c => c.id);
+    return { targetId: target.id, sourceIds, error: null };
+  }
+
+  // Pure function: turn the selected ids into a merge request.
+  // selectedIds: iterable of numeric cluster ids; byId: Map id -> cluster.
+  // Returns {targetId, sourceIds, error, target}.
+  function buildMergeRequest(selectedIds, byId) {
+    const ids = [...selectedIds];
+    const selected = ids.map(id => byId.get(id));
+    if (selected.some(c => !c)) {
+      return { targetId: null, sourceIds: [], error: 'Group list is stale; reload', target: null };
+    }
+    const { targetId, sourceIds, error } = chooseMergeTarget(selected);
+    if (error) return { targetId: null, sourceIds: [], error, target: null };
+    return { targetId, sourceIds, error: null, target: byId.get(targetId) };
+  }
+
+  // Pure: groups shown in the grid. Banned faces are single-face groups with
+  // their own list (Banned faces); they are never assigned, ignored or merged.
+  function visibleClusters(clusters) {
+    return (clusters || []).filter(c => c.status !== 'banned');
+  }
+
+  // Pure: which action row a group card shows.
+  //   'performer' -> the assigned performer, 'banned' -> none, 'curate' -> Assign / Ignore
+  function cardActions(c) {
+    if (c.status === 'assigned') return 'performer';
+    if (c.status === 'banned') return 'banned';
+    return 'curate';
+  }
+
+  // The merge button's action, DOM-free: resolve the request, confirm, call
+  // api.merge(sourceIds, targetId). Returns {merged, targetId, sourceIds, error}.
+  async function performMerge(selectedIds, byId, api, confirmFn, alertFn) {
+    if (!selectedIds || [...selectedIds].length < 2) {
+      return { merged: false, error: 'Select at least two groups' };
+    }
+    const { targetId, sourceIds, error, target } = buildMergeRequest(selectedIds, byId);
+    if (error) {
+      alertFn(error);
+      return { merged: false, error };
+    }
+    const label = target.name ? target.name : `Group #${target.id}`;
+    const statusNote = target.status === 'assigned'
+      ? `, assigned to ${target.performer_name || target.performer_id}`
+      : `, ${target.status}`;
+    if (!confirmFn(`Merge ${sourceIds.length} group(s) into "${label}" (${target.face_count} faces${statusNote})?`)) {
+      return { merged: false, error: null, targetId, sourceIds };
+    }
+    try {
+      await api.merge(sourceIds, targetId);
+    } catch (e) {
+      const msg = `Merge failed: ${e.message}`;
+      alertFn(msg);
+      return { merged: false, error: msg, targetId, sourceIds };
+    }
+    return { merged: true, error: null, targetId, sourceIds };
+  }
+
+  /** Restore one banned face to the unassigned pool after a confirm. Returns true if restored. */
+  async function performUnban(faceId, api, confirmFn, alertFn) {
+    if (!confirmFn('Restore this face to the unassigned pool? The next update can group it again.')) {
+      return false;
+    }
+    try {
+      await api.unban([faceId]);
+    } catch (e) {
+      alertFn(`Restore failed: ${e.message}`);
+      return false;
+    }
+    return true;
+  }
 
   // ==================== Helpers ====================
 
@@ -93,7 +227,13 @@
       return;
     }
 
-    const { clusters, stats } = data;
+    const { stats } = data;
+    const clusters = visibleClusters(data.clusters);
+    clustersById = new Map(clusters.map(c => [c.id, c]));
+    // drop selections of groups that are gone (merged, deleted, filtered out)
+    for (const id of [...selectedClusters]) {
+      if (!clustersById.has(id)) selectedClusters.delete(id);
+    }
 
     const header = `
       <div class="ss-actions" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
@@ -141,14 +281,14 @@
           </div>
         </div>
         <div class="ss-fg-thumbs" data-cluster-id="${c.id}"><div class="ss-loading-inline">…</div></div>
-        ${c.status !== 'assigned' ? `
+        ${cardActions(c) === 'curate' ? `
         <div style="display:flex;gap:6px;padding:0 12px 12px;">
           <button class="ss-btn ss-btn-sm ss-btn-primary fg-assign" data-cluster-id="${c.id}">Assign performer…</button>
           <button class="ss-btn ss-btn-sm ss-btn-secondary fg-ignore" data-cluster-id="${c.id}">Ignore</button>
-        </div>` : `
+        </div>` : cardActions(c) === 'performer' ? `
         <div style="padding:0 12px 12px;">
           <span style="opacity:.8;">→ ${esc(c.performer_name || c.performer_id)}</span>
-        </div>`}
+        </div>` : ''}
       </div>`).join('');
 
     container.innerHTML = `
@@ -182,23 +322,22 @@
     if (bannedBtn) bannedBtn.addEventListener('click', () => renderBannedList(container));
 
     const mergeBtn = container.querySelector('#fg-merge-btn');
-    if (mergeBtn) mergeBtn.addEventListener('click', () => {
-      if (selectedClusters.size < 2) return;
-      const ids = [...selectedClusters];
-      const targetId = ids[0]; // largest is first in list order
-      if (!confirm(`Merge ${ids.length - 1} group(s) into group #${targetId}?`)) return;
-      FaceGroupsAPI.merge(ids.filter(i => i !== targetId), targetId)
-        .then(() => {
-          selectedClusters.clear();
-          selectionMode = false;
-          renderList(container);
-        })
-        .catch(e => alert(`Merge failed: ${e.message}`));
+    if (mergeBtn) mergeBtn.addEventListener('click', async () => {
+      const r = await performMerge(selectedClusters, clustersById, FaceGroupsAPI,
+        msg => confirm(msg), msg => alert(msg));
+      if (r.merged) {
+        selectedClusters.clear();
+        selectionMode = false;
+        renderList(container);
+      }
     });
 
     container.querySelectorAll('[data-fg-filter]').forEach(btn => {
       btn.addEventListener('click', () => {
         currentFilter = btn.dataset.fgFilter || null;
+        // the list is rebuilt from the filtered groups only: a selection made
+        // under another filter could no longer be resolved
+        selectedClusters.clear();
         renderList(container);
       });
     });
@@ -275,7 +414,7 @@
           <h2 style="margin:0;">Banned faces (${faces.length})</h2>
           <button class="ss-btn ss-btn-sm ss-btn-secondary" id="fg-back">← All groups</button>
         </div>
-        <p style="opacity:.65;">These are excluded from all clustering. Select faces to restore them to the unassigned pool.</p>`;
+        <p style="opacity:.65;">These are excluded from all clustering. Click a face to restore it to the unassigned pool.</p>`;
       if (!faces.length) {
         panel.innerHTML = `${header}<div class="ss-empty-state"><p>No banned faces.</p></div>`;
       } else {
@@ -286,6 +425,13 @@
         panel.querySelectorAll('.ss-fg-unban').forEach(img => {
           FaceGroupsAPI.crop(parseInt(img.dataset.clusterId, 10), parseInt(img.dataset.faceId, 10))
             .then(r => { if (r.data_url) img.src = r.data_url; }).catch(() => {});
+          img.title = 'Click to restore';
+          img.addEventListener('click', async () => {
+            const faceId = parseInt(img.dataset.faceId, 10);
+            if (await performUnban(faceId, FaceGroupsAPI, m => confirm(m), m => alert(m))) {
+              renderBannedList(container);
+            }
+          });
         });
       }
       panel.querySelector('#fg-back').addEventListener('click', () => renderList(container));
@@ -542,7 +688,7 @@
   // ==================== Rebuild ====================
 
   async function rebuildGroups(container) {
-    if (!confirm('Update face groups?\n\nIncremental: new faces are matched against existing groups (assigned, matched, and open) by similarity and absorbed when close enough — scenes of faces absorbed into assigned groups are auto-tagged with that group\'s performer. Leftover faces form new open groups.')) return;
+    if (!confirm('Update face groups?\n\nIncremental: new faces are matched against existing groups (assigned, matched, and open) by similarity and absorbed when close enough — scenes of faces absorbed into assigned groups are auto-tagged with that group\'s performer. Leftover faces form new open groups. Faces you previously removed (ejected) from a group will not rejoin it.')) return;
     rebuildGroupsInProgress(container);
     try {
       const r = await FaceGroupsAPI.build({ incremental: true, auto_tag: true, replace_existing: true });
@@ -663,7 +809,9 @@
     console.log(`[${SS.PLUGIN_NAME}] Face Groups module loaded`);
   }
 
-  window.StashSenseFaceGroups = { init };
+  window.StashSenseFaceGroups = {
+    init, chooseMergeTarget, buildMergeRequest, visibleClusters, cardActions, performMerge, performUnban,
+  };
 
   init();
 })();

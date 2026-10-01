@@ -53,7 +53,7 @@ Translation is handled in `recommendations_router.py:update_performer_fields()`.
 ## Key Files
 
 - `api/recommendations_router.py` - All recommendation API endpoints
-- `api/recommendations_db.py` - SQLite database layer (schema version 9)
+- `api/recommendations_db.py` - SQLite database layer (schema version 14)
 - `api/queue_router.py` - Operation queue API endpoints
 - `api/queue_manager.py` - Queue execution engine with resource-aware scheduling
 - `api/settings_router.py` - Settings and system info API endpoints

@@ -101,13 +101,13 @@ class TestClusters:
         assert f1 not in unassigned
         assert f2 in unassigned
 
-    def test_ignored_cluster_faces_stay_unassigned(self, db):
-        """Faces in ignored clusters can be re-clustered."""
+    def test_ignored_cluster_faces_not_unassigned(self, db):
+        """Faces in ignored clusters stay put: they are never re-clustered."""
         f1 = _add_face(db, scene_id=1)
         cid = db.create_face_cluster()
         db.add_faces_to_cluster(cid, [f1])
         db.update_face_cluster(cid, status="ignored")
-        assert f1 in db.get_unassigned_face_ids()
+        assert f1 not in db.get_unassigned_face_ids()
 
     def test_top_matches(self, db):
         f1 = _add_face(db, scene_id=1, match_id="p1", match_name="Jane")
@@ -196,7 +196,9 @@ class TestBuildClustersService:
 
         matched = db.list_face_clusters("matched")
         assert len(matched) == 1
-        assert matched[0]["performer_id"] == "p1"
+        # performer_id is a LOCAL Stash id; the StashDB match lives in stash_ids
+        assert matched[0]["performer_id"] is None
+        assert db.get_cluster_stash_ids(matched[0]["id"]) == ["p1"]
         assert matched[0]["performer_name"] == "Jane"
         assert matched[0]["face_count"] == 2
 
@@ -269,12 +271,13 @@ class TestIncrementalClustering:
         from face_cluster_service import FaceClusterService
         svc = FaceClusterService(db)
 
-        # Base person: two faces assigned to performer-9
+        # Base person: two faces assigned to local performer 42 (StashDB uuid-9)
         base_fn = _emb_bytes(555)
         base_af = _emb_bytes(556)
-        f1 = _add_face(db, scene_id=1, match_id="p9", match_name="Jane")
+        f1 = _add_face(db, scene_id=1, match_id="uuid-9", match_name="Jane")
         f2 = _add_face(db, scene_id=2, facenet=_similar_emb(base_fn, seed=1), arcface=_similar_emb(base_af, seed=1))
-        cid = db.create_face_cluster(status="assigned", performer_id="p9", performer_name="Jane")
+        cid = db.create_face_cluster(status="assigned", performer_id="42", performer_name="Jane")
+        db.set_cluster_stash_ids(cid, ["uuid-9"])
         db.add_faces_to_cluster(cid, [f1, f2])
 
         # New similar face, no match anchor
@@ -283,7 +286,8 @@ class TestIncrementalClustering:
         result = svc.build_clusters(incremental=True)
         assert result["mode"] == "incremental"
         assert result["absorbed"] == 1
-        assert f3 in db.get_cluster_scene_ids(cid) or db.get_cluster_face_count(cid) == 3
+        assert f3 in {r["id"] for r in db.get_representative_faces(cid, limit=100)}
+        assert db.list_face_clusters("matched") == []
 
     def test_auto_tag_absorbed_scenes(self, db):
         from face_cluster_service import FaceClusterService
@@ -292,10 +296,12 @@ class TestIncrementalClustering:
         base_fn = _emb_bytes(444)
         base_af = _emb_bytes(445)
         f1 = _add_face(db, scene_id=1, facenet=base_fn, arcface=base_af)
-        cid = db.create_face_cluster(status="assigned", performer_id="p9", performer_name="Jane")
+        cid = db.create_face_cluster(status="assigned", performer_id="42", performer_name="Jane")
+        db.set_cluster_stash_ids(cid, ["uuid-9"])
         db.add_faces_to_cluster(cid, [f1])
 
-        f2 = _add_face(db, scene_id=7, facenet=_similar_emb(base_fn, seed=3), arcface=_similar_emb(base_af, seed=3))
+        f2 = _add_face(db, scene_id=7, match_id="uuid-9", match_name="Jane",
+                       facenet=_similar_emb(base_fn, seed=3), arcface=_similar_emb(base_af, seed=3))
 
         tagged = []
 
@@ -307,7 +313,7 @@ class TestIncrementalClustering:
 
         result = svc.build_clusters(incremental=True, auto_tag=True, stash_client=FakeStash())
         assert result["tagged_scenes"] == 1
-        assert ("7", ["p9"]) in tagged
+        assert ("7", ["42"]) in tagged
 
     def test_dissimilar_faces_form_new_group(self, db):
         from face_cluster_service import FaceClusterService
@@ -348,20 +354,24 @@ class TestIncrementalClustering:
         from face_cluster_service import FaceClusterService
         svc = FaceClusterService(db)
 
-        f1 = _add_face(db, scene_id=1, match_id="p9", match_name="Jane")
-        cid = db.create_face_cluster(status="assigned", performer_id="p9", performer_name="Jane")
+        f1 = _add_face(db, scene_id=1, match_id="uuid-9", match_name="Jane")
+        cid = db.create_face_cluster(status="assigned", performer_id="42", performer_name="Jane")
+        db.set_cluster_stash_ids(cid, ["uuid-9"])
         db.add_faces_to_cluster(cid, [f1])
 
-        # new face, same match anchor
-        f2 = _add_face(db, scene_id=2, match_id="p9", match_name="Jane")
+        # new face, same StashDB match anchor
+        f2 = _add_face(db, scene_id=2, match_id="uuid-9", match_name="Jane")
 
         svc.build_clusters(replace_existing=True)  # full build
         assert db.get_cluster_face_count(cid) == 2
         assert db.get_face_cluster(cid)["status"] == "assigned"
+        assert db.list_face_clusters("matched") == []
 
-    def test_schema_v11(self, db):
+    def test_schema_v14(self, db):
         with db._connection() as conn:
             version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-            assert version == 11
+            assert version == 14
             tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             assert "face_cluster_merge_log" in tables
+            assert "face_cluster_stash_ids" in tables
+            assert "face_rejections" in tables
