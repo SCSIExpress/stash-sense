@@ -18,16 +18,34 @@ The venv activation is required before `make sidecar` to ensure dependencies and
 
 - **`api/`** - FastAPI sidecar (Python) - face recognition, recommendations engine, upstream sync
 - **`plugin/`** - Stash plugin (JS/CSS/Python) - UI injected into Stash web interface
-- Sidecar runs on dev machine (`http://10.0.0.5:5000`), Stash runs on Unraid (`http://10.0.0.4:6969`)
+- Dev sidecar runs on the dev machine (`http://10.0.0.5:5000`); the deployed sidecar runs on Unraid (`http://10.0.0.44:6960`, container `stash-sense`). Stash runs on Unraid (`http://10.0.0.44:6969`)
 - Plugin backend (`stash_sense_backend.py`) proxies requests from Stash to sidecar to bypass CSP
 
 ## Deploying Plugin to Unraid
 
 ```bash
-scp plugin/* root@10.0.0.4:/mnt/nvme_cache/appdata/stash/config/plugins/stash-sense/
+scp plugin/* root@10.0.0.44:/mnt/cache/appdata/stash/config/plugins/stash-sense/
 ```
 
 Or deploy specific files only. Hard refresh Stash UI (Ctrl+Shift+R) after deploying JS/CSS changes.
+A new plugin file must also be listed in the plugin's `manifest`, or Stash won't serve it.
+
+## Deploying the Sidecar to Unraid
+
+The fork's image is `scsiexpress/stash-sense:face-groups-<sha>`, set in the Unraid template
+`/boot/config/plugins/dockerMan/templates-user/my-stash-sense.xml`. Data lives in `/mnt/cache/appdata/stash-sense`.
+
+```bash
+SHA=$(git rev-parse --short HEAD)
+docker build -t scsiexpress/stash-sense:face-groups-$SHA .
+docker save scsiexpress/stash-sense:face-groups-$SHA | gzip -1 | ssh root@10.0.0.44 'gunzip | docker load'
+ssh root@10.0.0.44 "sed -i 's#<Repository>.*</Repository>#<Repository>scsiexpress/stash-sense:face-groups-$SHA</Repository>#' /boot/config/plugins/dockerMan/templates-user/my-stash-sense.xml \
+  && /usr/local/emhttp/plugins/dynamix.docker.manager/scripts/rebuild_container stash-sense \
+  && docker start stash-sense"
+```
+
+- `rebuild_container` recreates from the template without pulling, and leaves the container stopped (it isn't in Unraid autostart), hence the `docker start`.
+- Back up `stash_sense.db` before deploying a schema change: `sqlite3 stash_sense.db ".backup <dir>/stash_sense.db"`.
 
 ## Testing
 
